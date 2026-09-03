@@ -28,6 +28,32 @@ const activeBots = new Map<string, Client>();
 // Track DM conversation counts with proper typing
 const dmConversationCounts = new Map<string, DMConversationCount>();
 
+function splitDiscordMessage(text: string, maxLength = 1900): string[] {
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf("\n", maxLength);
+
+    if (splitAt < maxLength * 0.5) {
+      splitAt = remaining.lastIndexOf(" ", maxLength);
+    }
+
+    if (splitAt <= 0) {
+      splitAt = maxLength;
+    }
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
 // Helper function to check if the bot can respond to a channel before responding
 function shouldAllowBotMessage(message: Message): boolean {
   // If in DM, skip chain logic entirely
@@ -204,14 +230,18 @@ async function createDiscordClientForBot(
       }
 
       // If it was a mention, reply to the message. Otherwise, send as normal message
-      if (isMentioned) {
-        await message.reply(aiResult.reply);
-      } else if (
-        message.channel instanceof BaseGuildTextChannel ||
-        message.channel instanceof DMChannel
-      ) {
-        await message.channel.send(aiResult.reply);
-      }
+      const replyChunks = splitDiscordMessage(aiResult.reply);
+
+for (let i = 0; i < replyChunks.length; i++) {
+  if (isMentioned && i === 0) {
+    await message.reply(replyChunks[i]);
+  } else if (
+    message.channel instanceof BaseGuildTextChannel ||
+    message.channel instanceof DMChannel
+  ) {
+    await message.channel.send(replyChunks[i]);
+  }
+}
     } catch (error) {
       console.error(`[Bot ${botConfig.id}] Error:`, error);
       const errorMessage =
@@ -293,7 +323,15 @@ async function handleDirectMessage(
       }
 
       // Send the AI's reply
-      await message.reply(aiResult.reply);
+      const replyChunks = splitDiscordMessage(aiResult.reply);
+
+for (let i = 0; i < replyChunks.length; i++) {
+  if (i === 0) {
+    await message.reply(replyChunks[i]);
+  } else {
+    await message.channel.send(replyChunks[i]);
+  }
+}
     }
   } catch (error) {
     console.error(`[Bot ${botConfig.id}] DM Error:`, error);
