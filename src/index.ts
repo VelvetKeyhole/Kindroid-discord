@@ -1,6 +1,9 @@
 import dotenv from "dotenv";
 import { initializeAllBots, shutdownAllBots } from "./discordManager";
 import { BotConfig } from "./types";
+import { createDatabase } from "./database";
+import { loadMemoryConfig } from "./memoryConfig";
+import { MemoryStore } from "./memoryStore";
 
 dotenv.config();
 
@@ -30,6 +33,7 @@ function loadBotConfigs(): BotConfig[] {
 
     configs.push({
       id: `bot${currentIndex}`,
+      kinId: process.env[`KIN_ID_${currentIndex}`]?.trim(),
       discordBotToken: botToken,
       sharedAiCode,
       enableFilter,
@@ -105,20 +109,26 @@ async function main(): Promise<void> {
 
     console.log(`Found ${botConfigs.length} bot configurations`);
 
+    const memoryConfig = loadMemoryConfig(botConfigs);
+    const database = memoryConfig.enabled ? createDatabase() : undefined;
+    const memoryRuntime = database ? { config: memoryConfig, store: new MemoryStore(database) } : undefined;
+
     // Initialize all bots
-    await initializeAllBots(botConfigs);
+    await initializeAllBots(botConfigs, memoryRuntime);
     console.log("All bots initialized successfully!");
 
     // Handle graceful shutdown
     process.on("SIGINT", async () => {
       console.log("\nReceived SIGINT. Shutting down...");
       await shutdownAllBots();
+      await database?.end();
       process.exit(0);
     });
 
     process.on("SIGTERM", async () => {
       console.log("\nReceived SIGTERM. Shutting down...");
       await shutdownAllBots();
+      await database?.end();
       process.exit(0);
     });
   } catch (error) {

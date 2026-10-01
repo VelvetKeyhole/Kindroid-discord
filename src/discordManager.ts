@@ -12,6 +12,9 @@ import {
 import { ephemeralFetchConversation } from "./messageFetch";
 import { callKindroidAI } from "./kindroidAPI";
 import { BotConfig, DMConversationCount } from "./types";
+import { MemoryRuntime, handleMemoryCommand, registerMemoryCommands } from "./memoryCommands";
+import { resolveMemoryScope } from "./memoryConfig";
+import { supplementConversation } from "./memoryContext";
 
 //Bot back and forth (prevent infinite loop but allow for mentioning other bots in conversation)
 type BotConversationChain = {
@@ -159,7 +162,8 @@ async function canRespondToChannel(
  * @param botConfig - Configuration for this bot instance
  */
 async function createDiscordClientForBot(
-  botConfig: BotConfig
+  botConfig: BotConfig,
+  memory?: MemoryRuntime
 ): Promise<Client> {
   const client = new Client({
     intents: [
@@ -174,6 +178,17 @@ async function createDiscordClientForBot(
   // Set up event handlers
   client.once("ready", () => {
     console.log(`Bot [${botConfig.id}] logged in as ${client.user?.tag}`);
+    if (memory && botConfig.kinId) {
+      void registerMemoryCommands(client, botConfig.kinId, memory.config).catch(() => {
+        console.warn("Memory command setup failed; normal bot messages remain available.");
+      });
+    }
+  });
+
+  client.on("interactionCreate", interaction => {
+    if (interaction.isChatInputCommand() && interaction.commandName === "memory") {
+      void handleMemoryCommand(interaction, botConfig.kinId, memory);
+    }
   });
 
   // Handle incoming messages
@@ -235,9 +250,12 @@ async function createDiscordClientForBot(
         );
 
         // Call Kindroid AI with the conversation context
+        const scope = memory ? resolveMemoryScope(memory.config, botConfig.kinId,
+          client.user?.id, message.guildId, message.channel.id) : undefined;
+        const supplemented = await supplementConversation(memory?.store, scope, conversationArray, message.content);
         const aiResult = await callKindroidAI(
           botConfig.sharedAiCode,
-          conversationArray,
+          supplemented,
           botConfig.enableFilter
         );
 
@@ -364,11 +382,11 @@ for (let i = 0; i < replyChunks.length; i++) {
  * Initialize all bots from their configurations
  * @param botConfigs - Array of bot configurations
  */
-async function initializeAllBots(botConfigs: BotConfig[]): Promise<Client[]> {
+async function initializeAllBots(botConfigs: BotConfig[], memory?: MemoryRuntime): Promise<Client[]> {
   console.log(`Initializing ${botConfigs.length} bots...`);
 
   const initPromises = botConfigs.map((config) =>
-    createDiscordClientForBot(config).catch((error) => {
+    createDiscordClientForBot(config, memory).catch((error) => {
       console.error(`Failed to initialize bot ${config.id}:`, error);
       return null;
     })

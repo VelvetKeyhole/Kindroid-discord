@@ -1,5 +1,6 @@
 export interface BotConfig {
   id: string;
+  kinId?: string;
   discordBotToken: string;
   sharedAiCode: string;
   enableFilter: boolean;
