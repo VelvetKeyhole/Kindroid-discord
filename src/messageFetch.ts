@@ -95,11 +95,21 @@ async function getUserDisplayName(msg: Message): Promise<string> {
  */
 async function fetchConversationFromDiscord(
   channel: TextChannel | DMChannel,
-  limit: number = 30
+  limit: number = 30,
+  triggeringMessage?: Message
 ): Promise<ConversationMessage[]> {
   try {
     // Fetch messages from Discord
     const fetched = await channel.messages.fetch({ limit });
+
+    // Keep the trigger even if newer messages have pushed it out of the window.
+    if (triggeringMessage && !fetched.has(triggeringMessage.id)) {
+      const oldest = Array.from(fetched.values()).sort(
+        (a, b) => a.createdTimestamp - b.createdTimestamp
+      )[0];
+      if (fetched.size >= limit && oldest) fetched.delete(oldest.id);
+      fetched.set(triggeringMessage.id, triggeringMessage);
+    }
 
     // Sort messages chronologically (oldest first)
     const sorted = Array.from(fetched.values()).sort(
@@ -155,23 +165,35 @@ async function fetchConversationFromDiscord(
  * @param channel - The Discord channel
  * @param limit - Number of messages to fetch
  * @param cacheDurationMs - How long to cache messages
+ * @param triggeringMessage - Refresh history and ensure this message is included
  */
 async function ephemeralFetchConversation(
   channel: TextChannel | DMChannel,
   limit: number = 30,
-  cacheDurationMs: number = 5000
+  cacheDurationMs: number = 5000,
+  triggeringMessage?: Message
 ): Promise<ConversationMessage[]> {
   const now = Date.now();
-  const cacheKey = channel.id;
+  const botId = channel.client.user?.id;
+  if (!botId) throw new Error("Bot client ID not found");
+  const cacheKey = `${botId}:${channel.id}:${limit}`;
   const cached = channelCache.get(cacheKey);
 
-  // Return cached data if it's fresh
-  if (cached && now - cached.lastFetchTime < cacheDurationMs) {
+  // Only reads without a trigger may reuse cached context.
+  if (
+    !triggeringMessage &&
+    cached &&
+    now - cached.lastFetchTime < cacheDurationMs
+  ) {
     return cached.messages;
   }
 
   // Fetch new data
-  const messages = await fetchConversationFromDiscord(channel, limit);
+  const messages = await fetchConversationFromDiscord(
+    channel,
+    limit,
+    triggeringMessage
+  );
 
   // Update cache
   channelCache.set(cacheKey, {

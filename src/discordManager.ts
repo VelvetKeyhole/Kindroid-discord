@@ -28,6 +28,21 @@ const activeBots = new Map<string, Client>();
 // Track DM conversation counts with proper typing
 const dmConversationCounts = new Map<string, DMConversationCount>();
 
+// Serialize the entire request/reply cycle for each bot and channel (including DMs).
+const conversationQueues = new Map<string, Promise<void>>();
+
+function enqueueConversation(key: string, task: () => Promise<void>): void {
+  const previous = conversationQueues.get(key) || Promise.resolve();
+  const current = previous.then(task).catch((error) => {
+    // A failed send must not block subsequent requests or reject the event handler.
+    console.error(`[Conversation ${key}] Error:`, error);
+  });
+  conversationQueues.set(key, current);
+  void current.then(() => {
+    if (conversationQueues.get(key) === current) conversationQueues.delete(key);
+  });
+}
+
 function splitDiscordMessage(text: string, maxLength = 1900): string[] {
   const chunks: string[] = [];
   let remaining = text;
@@ -162,7 +177,7 @@ async function createDiscordClientForBot(
   });
 
   // Handle incoming messages
-  client.on("messageCreate", async (message: Message) => {
+  client.on("messageCreate", (message: Message) => {
     // If the message is from the same bot, skip (avoid self-mention loops)
     if (message.author.bot && message.author.id === client.user?.id) {
       return;
@@ -180,81 +195,84 @@ async function createDiscordClientForBot(
       }
     }
 
-    if (!(await canRespondToChannel(message.channel))) return;
+    enqueueConversation(`${botConfig.id}:${message.channel.id}`, async () => {
+      if (!(await canRespondToChannel(message.channel))) return;
 
-    // Handle DMs differently from server messages
-    if (message.channel.type === ChannelType.DM) {
-      await handleDirectMessage(message, botConfig);
-      return;
-    }
-
-    // Get the bot's user information
-    const botUser = client.user;
-    if (!botUser) return; // Guard against undefined client.user
-
-    const botUsername = botUser.username.toLowerCase();
-
-    // Check if the message mentions or references the bot
-    const isMentioned = message.mentions.users.has(botUser.id);
-    const containsBotName = message.content.toLowerCase().includes(botUsername);
-
-    // Ignore if the bot is not mentioned or referenced
-    if (!isMentioned && !containsBotName) return;
-
-    try {
-      // Show typing indicator
-      if (
-        message.channel instanceof BaseGuildTextChannel ||
-        message.channel instanceof DMChannel
-      ) {
-        await message.channel.sendTyping();
-      }
-
-      // Fetch recent conversation with caching
-      const conversationArray = await ephemeralFetchConversation(
-        message.channel as TextChannel | DMChannel,
-        30, // last 30 messages
-        5000 // 5 second cache
-      );
-
-      // Call Kindroid AI with the conversation context
-      const aiResult = await callKindroidAI(
-        botConfig.sharedAiCode,
-        conversationArray,
-        botConfig.enableFilter
-      );
-
-      // If rate limited, silently ignore
-      if (aiResult.type === "rate_limited") {
+      // Handle DMs differently from server messages
+      if (message.channel.type === ChannelType.DM) {
+        await handleDirectMessage(message, botConfig);
         return;
       }
 
-      // If it was a mention, reply to the message. Otherwise, send as normal message
-      const replyChunks = splitDiscordMessage(aiResult.reply);
+      // Get the bot's user information
+      const botUser = client.user;
+      if (!botUser) return; // Guard against undefined client.user
 
-for (let i = 0; i < replyChunks.length; i++) {
-  if (isMentioned && i === 0) {
-    await message.reply(replyChunks[i]);
-  } else if (
-    message.channel instanceof BaseGuildTextChannel ||
-    message.channel instanceof DMChannel
-  ) {
-    await message.channel.send(replyChunks[i]);
-  }
-}
-    } catch (error) {
-      console.error(`[Bot ${botConfig.id}] Error:`, error);
-      const errorMessage =
-        "Beep boop, something went wrong. Please contact the Kindroid owner if this keeps up!";
-      if (isMentioned) {
-        await message.reply(errorMessage);
-      } else if (
-        message.channel instanceof BaseGuildTextChannel ||
-        message.channel instanceof DMChannel
-      ) {
-        await message.channel.send(errorMessage);
+      const botUsername = botUser.username.toLowerCase();
+
+      // Check if the message mentions or references the bot
+      const isMentioned = message.mentions.users.has(botUser.id);
+      const containsBotName = message.content.toLowerCase().includes(botUsername);
+
+      // Ignore if the bot is not mentioned or referenced
+      if (!isMentioned && !containsBotName) return;
+
+      try {
+        // Show typing indicator
+        if (
+          message.channel instanceof BaseGuildTextChannel ||
+          message.channel instanceof DMChannel
+        ) {
+          await message.channel.sendTyping();
+        }
+
+        // Refresh context for this request, including its triggering message.
+        const conversationArray = await ephemeralFetchConversation(
+          message.channel as TextChannel | DMChannel,
+          30, // last 30 messages
+          5000, // 5 second cache for reads without a trigger
+          message
+        );
+
+        // Call Kindroid AI with the conversation context
+        const aiResult = await callKindroidAI(
+          botConfig.sharedAiCode,
+          conversationArray,
+          botConfig.enableFilter
+        );
+
+        // If rate limited, silently ignore
+        if (aiResult.type === "rate_limited") {
+          return;
+        }
+
+        // If it was a mention, reply to the message. Otherwise, send as normal message
+        const replyChunks = splitDiscordMessage(aiResult.reply);
+
+        for (let i = 0; i < replyChunks.length; i++) {
+          if (isMentioned && i === 0) {
+            await message.reply(replyChunks[i]);
+          } else if (
+            message.channel instanceof BaseGuildTextChannel ||
+            message.channel instanceof DMChannel
+          ) {
+            await message.channel.send(replyChunks[i]);
+          }
+        }
+      } catch (error) {
+        console.error(`[Bot ${botConfig.id}] Error:`, error);
+        const errorMessage =
+          "Beep boop, something went wrong. Please contact the Kindroid owner if this keeps up!";
+        if (isMentioned) {
+          await message.reply(errorMessage);
+        } else if (
+          message.channel instanceof BaseGuildTextChannel ||
+          message.channel instanceof DMChannel
+        ) {
+          await message.channel.send(errorMessage);
+        }
       }
-    }
+    });
   });
 
   // Handle errors
@@ -307,7 +325,8 @@ async function handleDirectMessage(
       const conversationArray = await ephemeralFetchConversation(
         message.channel,
         30,
-        5000
+        5000,
+        message
       );
 
       // Call Kindroid AI
