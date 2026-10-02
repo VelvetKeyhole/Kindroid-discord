@@ -197,6 +197,15 @@ async function createDiscordClientForBot(
     if (message.author.bot && message.author.id === client.user?.id) {
       return;
     }
+    console.log("[MESSAGE META]", {
+  bot: client.user?.username,
+  botId: client.user?.id,
+  author: message.author.username,
+  authorId: message.author.id,
+  channelId: message.channel.id,
+  guildId: message.guildId,
+  isDM: message.guildId === null,
+});
 
     if (message.author.bot) {
       if (!shouldAllowBotMessage(message)) {
