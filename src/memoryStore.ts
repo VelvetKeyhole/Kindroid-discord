@@ -294,6 +294,33 @@ export class MemoryStore {
     });
   }
 
+  async activate(scope: MemoryScope, id: string, actor: string): Promise<MemoryRecord | undefined> {
+    if (!uuid.test(id)) return undefined;
+    return this.locked(scope, async (store, values) => {
+      const current = (await store.database.query<MemoryRecord>(
+        `SELECT * FROM memories WHERE ${scopeWhere} AND id=$6 FOR UPDATE`, [...values, id]
+      )).rows[0];
+      if (!current || current.status !== 'inactive' || current.active !== false) return undefined;
+      // An inactive record is absent from normal conflict scans. Check the conflict it
+      // would introduce against active canon, without relaxing scope or privacy.
+      if (current.metadata.factKey) {
+        const conflict = await store.database.query(
+          `SELECT id FROM memories WHERE ${scopeWhere} AND id<>$6 AND status='active'
+           AND metadata->>'factKey'=$7 AND metadata->>'assertion' IS DISTINCT FROM $8::text LIMIT 1`,
+          [...values, id, current.metadata.factKey, current.metadata.assertion ?? null]
+        );
+        if (conflict.rows.length) return undefined;
+      }
+      // Change only activation and audit fields. The existing triggers append revision/audit
+      // history atomically; never copy metadata from a stale snapshot into this update.
+      return (await store.database.query<MemoryRecord>(
+        `UPDATE memories SET active=true,status='active',change_type='activate',change_reason=NULL,
+         updated_by=$7,updated_at=now() WHERE ${scopeWhere} AND id=$6 AND status='inactive' AND active=false RETURNING *`,
+        [...values, id, actor]
+      )).rows[0];
+    });
+  }
+
   async retcon(scope: MemoryScope, id: string, content: string, actor: string, reason: string, correction: { factKey?: string; assertion?: string } = {}): Promise<MemoryRecord | undefined> {
     if (!uuid.test(id) || !reason.trim() || reason.length > 500) throw new Error('Retcons require a reason');
     return this.locked(scope, async (store, values) => {

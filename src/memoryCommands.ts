@@ -43,6 +43,8 @@ export function memoryCommandDefinition(): SlashCommandBuilder {
     .addSubcommand(c=>c.setName('restore').setDescription('Restore a revision without automatically activating it')
       .addStringOption(o=>o.setName('id').setDescription('Memory UUID').setRequired(true))
       .addStringOption(o=>o.setName('revision').setDescription('Revision number from history').setRequired(true)))
+    .addSubcommand(c=>c.setName('activate').setDescription('Reactivate an inactive memory without changing its privacy')
+      .addStringOption(o=>o.setName('id').setDescription('Inactive memory UUID').setRequired(true)))
     .addSubcommand(c=>c.setName('retcon').setDescription('Correct canon as a production override, retaining history')
       .addStringOption(o=>o.setName('id').setDescription('Memory UUID').setRequired(true))
       .addStringOption(o=>o.setName('content').setDescription('Corrected summary').setRequired(true).setMaxLength(1000))
@@ -128,6 +130,11 @@ export async function handleMemoryCommand(
         files:[{attachment:Buffer.from(JSON.stringify(history,null,2)),name:'memory-history.json'}]}); return;
     }
     if (command==='restore') { await respond(await runtime.store.restore(scope,id,interaction.options.getString('revision')||'',interaction.user.id) ? 'Revision restored without automatic activation. Review before enabling.' : 'Memory/revision not found.'); return; }
+    if (command==='activate') {
+      const memory = await runtime.store.activate(scope,id,interaction.user.id);
+      await respond(memory ? 'Memory activated; existing privacy and governance preserved.' : 'Memory cannot be activated. It must be inactive, disabled, in this exact context, and free of conflicts with active canon.');
+      return;
+    }
     if (command==='retcon') { await respond(await runtime.store.retcon(scope,id,interaction.options.getString('content')||'',interaction.user.id,interaction.options.getString('reason')||'',metadataOptions(interaction)) ? 'Production correction recorded; previous text preserved in history.' : 'Memory not found or not eligible.'); return; }
     if (command==='merge') { await respond(await runtime.store.merge(scope,id,interaction.options.getString('duplicate')||'',interaction.user.id) ? 'Merged; original records and provenance retained.' : 'Memories not found.'); return; }
     if (command==='conflicts') { await respond((await runtime.store.conflicts(scope)).slice(0,15).map(c=>`${c.fact_key}: ${c.id} / ${c.other_id}`).join('\n') || 'No flagged conflicts. Detection is conservative.'); return; }

@@ -170,6 +170,13 @@ Large reports use private attachments; protect downloaded files too.
 - `/memory restore id:UUID revision:NUMBER`: recover text/metadata without automatic activation.
   Automatic candidates return to pending; rejected records remain rejected. Manual recovery
   is inactive and needs deliberate enabling. Restoration is itself a new revision.
+- `/memory activate id:UUID`: deliberately reactivate an inactive, disabled note after review.
+  Admin-only and ephemeral; preserves current text, privacy, knowledge, sources and original
+  content. Pending/rejected/archived/superseded and already-active notes are rejected. A same-scope
+  active note with the same `factKey` but a different `assertion` blocks activation, even if its
+  visibility differs. Conflict detection uses these explicit fields, not semantic inference.
+  Uses the existing kin/context/row transaction locks and appends an `activate` revision/audit
+  with the admin actor. Activation does not bypass expiry, knowledge time or retrieval filters.
 - `/memory delete id:UUID confirm:true`: archive, never hard-delete. History/restore still work.
 - `/memory retcon id:UUID content:... reason:...`: explicit production correction of an active/
   inactive record, preserving old text and privacy. This is not an in-story event. It does not

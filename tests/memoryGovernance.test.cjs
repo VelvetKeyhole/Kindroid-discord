@@ -379,3 +379,101 @@ test('failed memory creation rolls back its kin/context binding too; public expo
  assert.match(exported.warning,/NOT PUBLICATION-SAFE/);assert.match(exported.readable,/confidential/i);
  assert.equal(exported.bundle.items[0].original_content,'Confidential original promise.');
 });
+
+
+async function restoredInactive(inputOverride={}) {
+ const memory=await store.add(scope,{...input,...inputOverride},admin);
+ const original=(await store.history(scope,memory.id))[0];
+ await store.edit(scope,memory.id,{...input,content:'Later edited summary.'},undefined,admin);
+ return store.restore(scope,memory.id,String(original.id),admin);
+}
+
+test('activation restores reviewed inactive canon while preserving private governance and all previous history',async()=>{
+ const restored=await restoredInactive({metadata:{visibility:'private',knownAt:past,knownByKinIds:[scope.kinId,'dee-villa'],sourceSnapshot:'Private source evidence.',sourceType:'production_override',authoritative:true},
+  provenance:{sourceChannelId:scope.channelId,occurredAt:past,subjects:['dee-villa'],sourceMessageIds:['555555555555555555']}});
+ assert.equal(restored.status,'inactive');assert.equal(restored.active,false);
+ const previousHistory=await store.history(scope,restored.id),previousAudit=await store.audit(scope);
+ const activated=await store.activate(scope,restored.id,admin);
+ assert.equal(activated.active,true);assert.equal(activated.status,'active');
+ for(const field of ['content','metadata','original_content','kin_id','storyline','guild_id','context_id','context_type','source_channel_id','source_message_ids','subjects','origin_kind','created_by','created_at','occurred_at'])assert.deepEqual(activated[field],restored[field],field);
+ assert.equal(activated.metadata.visibility,'private');assert.deepEqual(await store.retrieve(scope,['promise']),[]);
+ assert.ok((await store.retrieve({...scope,visibility:'private'},['promise'])).some(m=>m.id===restored.id));
+ const history=await store.history(scope,restored.id);assert.equal(history.length,previousHistory.length+1);assert.deepEqual(history.slice(1),previousHistory);
+ assert.equal(history[0].operation,'activate');assert.equal(history[0].actor_id,admin);assert.equal(history[0].snapshot.change_type,'activate');assert.equal(history[0].snapshot.active,true);
+ const audit=await store.audit(scope);assert.equal(audit.length,previousAudit.length+1);assert.deepEqual(audit.slice(1),previousAudit);
+ assert.equal(audit[0].operation,'activate');assert.equal(audit[0].actor_id,admin);assert.equal(audit[0].memory_id,restored.id);
+});
+
+test('activation refuses pending/rejected/archived/superseded/already-active records and invalid or foreign IDs',async()=>{
+ for(const status of ['pending','rejected','archived','superseded','active']) {
+  const memory=await store.add(scope,{...input,content:'Activation guard '+status},admin);
+  await db.query('UPDATE memories SET status=$2,active=$3 WHERE id=$1',[memory.id,status,status==='active']);
+  const history=await store.history(scope,memory.id),audit=await store.audit(scope);
+  assert.equal(await store.activate(scope,memory.id,admin),undefined);
+  assert.deepEqual(await store.history(scope,memory.id),history);assert.deepEqual(await store.audit(scope),audit);
+  assert.equal((await store.show(scope,memory.id,true)).status,status);
+ }
+ const inactive=await restoredInactive();
+ assert.equal(await store.activate(scope,'not-a-uuid',admin),undefined);
+ assert.equal(await store.activate({...scope,storyline:'other-story'},inactive.id,admin),undefined);
+ assert.equal((await store.show(scope,inactive.id)).active,false);
+});
+
+test('activation blocks prospective conflicts with active canon regardless of visibility and allows resolved equivalents',async()=>{
+ const inactive=await restoredInactive({metadata:{visibility:'private',factKey:'vincent-current-partner',assertion:'dee',knownAt:past}});
+ const other=await store.add(scope,{...input,content:'Vincent is with Naomi.',metadata:{visibility:'public',factKey:'vincent-current-partner',assertion:'naomi',knownAt:past}},admin);
+ const history=await store.history(scope,inactive.id);
+ assert.equal(await store.activate(scope,inactive.id,admin),undefined);assert.deepEqual(await store.history(scope,inactive.id),history);
+ assert.equal((await store.show(scope,inactive.id)).status,'inactive');
+ await store.edit(scope,other.id,{...input,metadata:{assertion:'dee'}},undefined,admin);
+ assert.equal((await store.activate(scope,inactive.id,admin)).status,'active');
+});
+
+test('activation serializes with metadata edits in both orders and stale edits cannot restore old privacy',async()=>{
+ for(const editFirst of [true,false]) {
+  const inactive=await restoredInactive(),stale=await store.show(scope,inactive.id);
+  const edit=()=>store.edit(scope,inactive.id,{...input,metadata:{visibility:'private',knownByKinIds:[scope.kinId,'dee-villa'],sourceType:'production_override',authoritative:true}},undefined,admin);
+  const activate=()=>store.activate(scope,inactive.id,admin);
+  await Promise.all(editFirst?[edit(),activate()]:[activate(),edit()]);
+  const current=await store.show(scope,inactive.id);
+  assert.equal(current.status,'active');assert.equal(current.active,true);assert.equal(current.metadata.visibility,'private');
+  assert.deepEqual(current.metadata.knownByKinIds,[scope.kinId,'dee-villa']);assert.equal(authority(current.metadata),4);
+  await assert.rejects(store.edit(scope,inactive.id,{...input,metadata:stale.metadata},false,admin,stale.edit_version),MemoryEditConflict);
+  assert.deepEqual((await store.show(scope,inactive.id)).metadata,current.metadata);
+ }
+});
+
+test('concurrent activation runs once and a concurrent conflict-producing edit is observed before activation',async()=>{
+ const inactive=await restoredInactive();
+ const results=await Promise.all([store.activate(scope,inactive.id,admin),store.activate(scope,inactive.id,admin)]);
+ assert.equal(results.filter(Boolean).length,1);assert.equal((await store.history(scope,inactive.id)).filter(r=>r.operation==='activate').length,1);
+ const next=await restoredInactive({metadata:{factKey:'activation-race-key',assertion:'one'}});
+ const other=await store.add(scope,{...input,metadata:{factKey:'activation-race-key',assertion:'one'}},admin);
+ const ordered=await Promise.all([store.edit(scope,other.id,{...input,metadata:{assertion:'two'}},undefined,admin),store.activate(scope,next.id,admin)]);
+ assert.equal(ordered[1],undefined);assert.equal((await store.show(scope,next.id)).status,'inactive');
+});
+
+test('activation rolls back when its audit trigger fails, retaining inactive state and previous revisions',async()=>{
+ const inactive=await restoredInactive(),history=await store.history(scope,inactive.id),audit=await store.audit(scope);
+ await pg.exec(`CREATE FUNCTION test_activation_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+ BEGIN IF NEW.operation='activate' THEN RAISE EXCEPTION 'Injected audit failure'; END IF; RETURN NEW; END $$;
+ CREATE TRIGGER test_activation_audit_failure BEFORE INSERT ON memory_audit FOR EACH ROW EXECUTE FUNCTION test_activation_audit_failure();`);
+ try {await assert.rejects(store.activate(scope,inactive.id,admin));}
+ finally {await pg.exec('DROP TRIGGER test_activation_audit_failure ON memory_audit; DROP FUNCTION test_activation_audit_failure();');}
+ assert.equal((await store.show(scope,inactive.id)).status,'inactive');assert.deepEqual(await store.history(scope,inactive.id),history);assert.deepEqual(await store.audit(scope),audit);
+});
+
+test('activate slash command requires an ID, stays under Discord limits, is admin-only and responds privately',async()=>{
+ const definition=memoryCommandDefinition().toJSON();assert.ok(definition.options.length<=25);
+ const command=definition.options.find(c=>c.name==='activate');assert.ok(command);assert.equal(command.options[0].name,'id');assert.equal(command.options[0].required,true);
+ const inactive=await restoredInactive(),responses=[];
+ const runtime={config:{enabled:true,adminUserIds:new Set([admin]),contexts:[scope]},store};
+ await handleMemoryCommand({user:{id:'999999999999999999'},reply:async p=>responses.push(p)},scope.kinId,runtime);
+ assert.equal(responses[0].flags,64);assert.equal((await store.show(scope,inactive.id)).status,'inactive');
+ responses.length=0;
+ const invocation={user:{id:admin},client:{user:{id:scope.discordBotId}},guildId:scope.guildId,channelId:scope.channelId,channel:null,deferred:false,replied:false,
+  options:{getSubcommand:()=> 'activate',getString:()=>inactive.id},deferReply:async p=>{responses.push(p);invocation.deferred=true;},editReply:async p=>responses.push(p)};
+ await handleMemoryCommand(invocation,scope.kinId,runtime);assert.equal(responses[0].flags,64);assert.match(responses.at(-1).content,/Memory activated/);
+ assert.equal((await store.show(scope,inactive.id)).status,'active');
+ responses.length=0;await handleMemoryCommand(invocation,scope.kinId,runtime);assert.match(responses.at(-1).content,/cannot be activated/);
+});
