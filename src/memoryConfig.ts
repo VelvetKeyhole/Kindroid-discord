@@ -37,6 +37,30 @@ export function loadMemoryConfig(bots: BotConfig[]): MemoryConfig {
     throw new Error("MEMORY_ADMIN_USER_IDS must contain Discord user IDs");
   }
   config.adminUserIds = new Set(admins);
+
+  // Temporary diagnostics: inspect the raw value without logging its contents.
+  const raw = process.env.MEMORY_CONTEXTS;
+  let jsonParseSucceeded = false;
+  let parsedIsArray = false;
+  let entryCount: number | null = null;
+  try {
+    if (raw !== undefined) {
+      const diagnosticValue: unknown = JSON.parse(raw);
+      jsonParseSucceeded = true;
+      parsedIsArray = Array.isArray(diagnosticValue);
+      entryCount = Array.isArray(diagnosticValue) ? diagnosticValue.length : null;
+    }
+  } catch {
+    // Parsing errors can include input text; leave them out of diagnostic logs.
+  }
+  console.info({
+    exists: raw !== undefined,
+    characterLength: raw?.length ?? 0,
+    jsonParseSucceeded,
+    parsedIsArray,
+    entryCount,
+  });
+
   const parsed: unknown = JSON.parse(process.env.MEMORY_CONTEXTS || "[]");
   if (!Array.isArray(parsed) || !parsed.length) throw new Error("MEMORY_CONTEXTS must be a nonempty JSON array");
   const locations = new Set<string>();
