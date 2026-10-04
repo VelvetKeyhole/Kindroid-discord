@@ -22,24 +22,65 @@ export function createDatabase(): Pool {
   return pool;
 }
 
+const migrationFailureMessage = "Memory migration failed. Check DATABASE_URL and database permissions.";
+const safeMigrationMessages = new Set([
+  "permission denied for schema public",
+  "relation does not exist",
+  ...["memory_schema_migrations", "memory_kins", "memory_contexts", "memories"].flatMap(table => [
+    `permission denied for table ${table}`,
+    `must be owner of table ${table}`,
+    `relation "${table}" does not exist`,
+  ]),
+]);
+
+function logMigrationFailure(stage: string, error: unknown): void {
+  const fields = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const code = typeof fields.code === "string" && (
+    /^[0-9A-Z]{5}$/.test(fields.code) ||
+    ["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"].includes(fields.code)
+  ) ? fields.code : "unknown";
+  const message = typeof fields.message === "string" && safeMigrationMessages.has(fields.message)
+    ? fields.message : migrationFailureMessage;
+  // Temporary diagnostics: never pass the original error or connection details to the logger.
+  console.error({ stage, code, message });
+}
+
 export async function migrateDatabase(pool: Pool): Promise<void> {
-  const sql = await readFile(join(__dirname, "../migrations/001_memory.sql"), "utf8");
-  const client = await pool.connect();
+  let stage = "read-migration-file";
   try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(618034251)");
-    await client.query("CREATE TABLE IF NOT EXISTS memory_schema_migrations (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
-    const existing = await client.query("SELECT id FROM memory_schema_migrations WHERE id = $1", ["001_memory"]);
-    if (!existing.rowCount) {
-      await client.query(sql);
-      await client.query("INSERT INTO memory_schema_migrations (id) VALUES ($1)", ["001_memory"]);
+    const sql = await readFile(join(__dirname, "../migrations/001_memory.sql"), "utf8");
+    stage = "connect-database";
+    const client = await pool.connect();
+    try {
+      stage = "begin-transaction";
+      await client.query("BEGIN");
+      stage = "acquire-migration-lock";
+      await client.query("SELECT pg_advisory_xact_lock(618034251)");
+      stage = "create-migration-tracker";
+      await client.query("CREATE TABLE IF NOT EXISTS memory_schema_migrations (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
+      stage = "check-migration-record";
+      const existing = await client.query("SELECT id FROM memory_schema_migrations WHERE id = $1", ["001_memory"]);
+      if (!existing.rowCount) {
+        stage = "execute-memory-schema";
+        await client.query(sql);
+        stage = "record-migration";
+        await client.query("INSERT INTO memory_schema_migrations (id) VALUES ($1)", ["001_memory"]);
+      }
+      stage = "commit-transaction";
+      await client.query("COMMIT");
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // Preserve the original error and failing stage if rollback also fails.
+      }
+      throw error;
+    } finally {
+      client.release();
     }
-    await client.query("COMMIT");
   } catch (error) {
-    await client.query("ROLLBACK");
+    logMigrationFailure(stage, error);
     throw error;
-  } finally {
-    client.release();
   }
 }
 
@@ -47,6 +88,6 @@ if (require.main === module) {
   dotenv.config();
   const pool = createDatabase();
   migrateDatabase(pool).then(() => console.log("Memory migration complete."))
-    .catch(() => { console.error("Memory migration failed. Check DATABASE_URL and database permissions."); process.exitCode = 1; })
+    .catch(() => { process.exitCode = 1; })
     .finally(() => pool.end());
 }
