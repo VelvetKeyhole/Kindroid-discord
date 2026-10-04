@@ -1,4 +1,4 @@
-import { ChatInputCommandInteraction, Client, MessageFlags, SlashCommandBuilder } from "discord.js";
+import { ChatInputCommandInteraction, Client, MessageFlags, SlashCommandBuilder, ChannelType } from "discord.js";
 import { MemoryConfig, resolveMemoryScope, resolvedContext } from "./memoryConfig";
 import { MemoryExtractionWorker } from "./memoryExtraction";
 import { MemoryCategory, MemoryInput, MemoryStore, MemoryEditConflict, memoryCategories, validateMemory } from "./memoryStore";
@@ -94,6 +94,29 @@ function parseTags(text: string): string[] {
   return text.split(",").map(tag => tag.trim()).filter(Boolean);
 }
 
+async function resolveCommandScope(interaction: ChatInputCommandInteraction, kinId: string | undefined, config: MemoryConfig) {
+  const botId = interaction.client.user?.id;
+  // Exact mappings need no cached channel/category and always take precedence.
+  const exact = resolveMemoryScope(config, kinId, botId, interaction.guildId, interaction.channelId);
+  if (exact || !interaction.guildId || !kinId || !botId || !config.enabled) return exact;
+  const categories = config.contexts.filter(c => c.kinId === kinId && c.guildId === interaction.guildId && c.categoryId);
+  if (!categories.length) return undefined;
+  // REST can take longer than Discord's acknowledgement window. Do this only after authorization.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const channel = await interaction.client.channels.fetch(interaction.channelId, { force: true });
+  if (!channel || channel.id !== interaction.channelId || !("guildId" in channel) || channel.guildId !== interaction.guildId ||
+      channel.isThread() || !("parentId" in channel) || !categories.some(c => c.categoryId === channel.parentId)) return undefined;
+  // permissionsLocked depends on the parent's cached overwrites. Refresh both sides before
+  // checking, so missing/stale caches neither reject valid inheritance nor weaken privacy.
+  const parent = await interaction.client.channels.fetch(channel.parentId!, { force: true });
+  if (!parent || parent.id !== channel.parentId || parent.type !== ChannelType.GuildCategory ||
+      !("guildId" in parent) || parent.guildId !== interaction.guildId) return undefined;
+  return resolveMemoryScope(config, kinId, botId, interaction.guildId, interaction.channelId, {
+    categoryId: channel.parentId, isThread: channel.isThread(),
+    categoryPermissionsSynced: "permissionsLocked" in channel && channel.permissionsLocked === true,
+  });
+}
+
 export async function handleMemoryCommand(
   interaction: ChatInputCommandInteraction, kinId: string | undefined, runtime: MemoryRuntime | undefined
 ): Promise<void> {
@@ -109,17 +132,12 @@ export async function handleMemoryCommand(
       await respond("Memory administration is unavailable or you are not authorized.");
       return;
     }
-    const scope = resolveMemoryScope(runtime.config, kinId, interaction.client.user?.id,
-      interaction.guildId, interaction.channelId, {
-        categoryId: interaction.channel && "parentId" in interaction.channel ? interaction.channel.parentId : null,
-        isThread: interaction.channel?.isThread() ?? false,
-        categoryPermissionsSynced: interaction.channel && "permissionsLocked" in interaction.channel ? interaction.channel.permissionsLocked === true : false,
-      });
+    const scope = await resolveCommandScope(interaction, kinId, runtime.config);
     if (!scope) {
       await respond("Memory is not configured for this kin and channel. DMs are not enabled.");
       return;
     }
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (!interaction.deferred) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const command = interaction.options.getSubcommand();
     const id = interaction.options.getString("id") || "";
     const context = resolvedContext(scope);

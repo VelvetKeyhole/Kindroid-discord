@@ -279,3 +279,111 @@ test('configuration accepts category options, rejects mixed scopes, and defaults
     Object.assign(process.env, original);
   }
 });
+
+
+const {ChannelType}=require('discord.js');
+function categoryInteraction(command,values={},options={}) {
+ const invocation=interaction(command,values,options.userId??admin),calls=[];
+ invocation.channelId=options.channelId??scope.channelId;invocation.guildId=options.dm?null:scope.guildId;
+ invocation.channel=options.cachedChannel??null;
+ let parentFetched=false;
+ const channel={id:invocation.channelId,guildId:options.foreignGuild?'999999999999999999':scope.guildId,parentId:options.parentId??categoryId,
+  isThread:()=>options.thread===true,get permissionsLocked(){return parentFetched && options.synced!==false;}};
+ const parent={id:channel.parentId,guildId:scope.guildId,type:ChannelType.GuildCategory};
+ invocation.client.channels={fetch:async(id,fetchOptions)=>{
+  assert.equal(invocation.deferred,true,'REST must follow ephemeral acknowledgement');assert.deepEqual(fetchOptions,{force:true});calls.push(id);
+  if(options.failFetch)throw new Error('Discord channel fetch failed');
+  if(id===channel.id){parentFetched=false;return channel;}
+  if(id===parent.id){parentFetched=true;return parent;}
+  throw new Error('Unexpected channel fetch');
+ }};
+ return {invocation,calls,channel};
+}
+const categoryConfig={...config,contexts:[{kinId:scope.kinId,storyline:scope.storyline,guildId:scope.guildId,categoryId}]};
+
+test('category slash add/list/show resolve uncached interaction channels and refresh the parent permission cache',async()=>{
+ const runtime={config:categoryConfig,store};
+ const {invocation,calls}=categoryInteraction('add',{content:input.content,category:input.category,tags:'dee'});
+ await handleMemoryCommand(invocation,scope.kinId,runtime);
+ assert.deepEqual(calls,[scope.channelId,categoryId]);assert.equal(invocation.responses[0].flags,MessageFlags.Ephemeral);
+ assert.match(invocation.responses.at(-1).content,/Memory added/);
+ const resolved={...scope,contextType:'category',contextId:categoryId};const saved=(await store.list(resolved))[0];
+ assert.equal(saved.context_id,categoryId);assert.equal(saved.context_type,'category');assert.equal(saved.source_channel_id,scope.channelId);
+ const sibling='888888888888888888';
+ for(const command of ['list','show']) {
+  const testCase=categoryInteraction(command,{id:saved.id},{channelId:sibling});
+  await handleMemoryCommand(testCase.invocation,scope.kinId,runtime);
+  assert.deepEqual(testCase.calls,[sibling,categoryId]);assert.equal(testCase.invocation.responses[0].flags,MessageFlags.Ephemeral);
+  assert.ok(testCase.invocation.responses.at(-1).content.includes(saved.id));
+ }
+});
+
+test('exact private/confessional slash mappings override categories without fetching or importing category knowledge',async()=>{
+ await store.add({...scope,contextType:'category',contextId:categoryId},input,admin);
+ for(const visibility of ['private','confessional']) {
+  const channelId=visibility==='private'?'888888888888888888':'999999999999999999';
+  const exact={kinId:scope.kinId,storyline:'exact-story',guildId:scope.guildId,channelId,visibility};
+  const runtime={config:{...categoryConfig,contexts:[...categoryConfig.contexts,exact]},store};
+  const testCase=categoryInteraction('add',{content:'Exact private confession.',category:'personal_fact'},{channelId});
+  await handleMemoryCommand(testCase.invocation,scope.kinId,runtime);assert.deepEqual(testCase.calls,[]);
+  const rows=await store.list({...scope,...exact,contextType:'channel',contextId:channelId});
+  assert.equal(rows.length,1);assert.equal(rows[0].metadata.visibility,visibility);assert.equal(rows[0].context_type,'channel');
+  assert.ok(!rows.some(row=>row.content===input.content));
+ }
+});
+
+test('category slash fallback rejects unrelated categories, DMs, threads, foreign guilds and unsynchronized permissions',async()=>{
+ let writes=0;const runtime={config:categoryConfig,store:{add:async()=>{writes++;throw new Error('must not write');}}};
+ for(const options of [{parentId:'999999999999999999'},{dm:true},{thread:true},{synced:false},{foreignGuild:true}]) {
+  const testCase=categoryInteraction('add',{content:input.content,category:input.category},options);
+  await handleMemoryCommand(testCase.invocation,scope.kinId,runtime);
+  assert.match(testCase.invocation.responses.at(-1).content,/not configured/);
+  assert.equal(testCase.invocation.responses[0].flags,MessageFlags.Ephemeral);
+  if(options.dm)assert.equal(testCase.calls.length,0);
+  if(options.thread || options.parentId || options.foreignGuild)assert.equal(testCase.calls.length,1);
+ }
+ assert.equal(writes,0);
+ const unauthorized=categoryInteraction('add',{}, {userId:'999999999999999999'});
+ await handleMemoryCommand(unauthorized.invocation,scope.kinId,runtime);assert.equal(unauthorized.calls.length,0);
+ const failed=categoryInteraction('add',{content:input.content,category:input.category},{failFetch:true});
+ await handleMemoryCommand(failed.invocation,scope.kinId,runtime);assert.equal(writes,0);assert.equal(failed.invocation.responses[0].flags,MessageFlags.Ephemeral);
+});
+
+test('an explicitly configured thread keeps exact scope and never inherits its parent category',async()=>{
+ const runtime={config:{...categoryConfig,contexts:[...categoryConfig.contexts,{...scope,visibility:'private'}]},store};
+ const testCase=categoryInteraction('add',{content:input.content,category:input.category},{thread:true});
+ await handleMemoryCommand(testCase.invocation,scope.kinId,runtime);assert.deepEqual(testCase.calls,[]);
+ const saved=(await store.list(scope))[0];assert.equal(saved.context_type,'channel');assert.equal(saved.context_id,scope.channelId);assert.equal(saved.metadata.visibility,'private');
+});
+
+test('every memory subcommand shares verified category resolution before accessing storage',async()=>{
+ const calls=[];const saved={...input,id:'00000000-0000-4000-8000-000000000001',metadata:{visibility:'public',knownByKinIds:[scope.kinId]},status:'active',edit_version:'1'};
+ const storage={};
+ for(const method of ['add','list','show','edit','delete','history','restore','activate','approve','reject','retcon','merge','conflicts','scan','autoSetting','setAutoSetting'])storage[method]=async resolved=>{
+  calls.push({method,resolved});
+  if(['list','history','conflicts','scan'].includes(method))return [];
+  if(method==='autoSetting')return null;
+  return saved;
+ };
+ const runtime={config:categoryConfig,store:storage};
+ const commands=['add','list','show','edit','delete','history','restore','activate','approve','reject','retcon','merge','conflicts','snapshot','pending','auto-status','auto-on','auto-off'];
+ for(const command of commands) {
+  calls.length=0;
+  const testCase=categoryInteraction(command,{id:saved.id,content:input.content,category:input.category,confirm:true,revision:'1',reason:'Review',duplicate:saved.id});
+  await handleMemoryCommand(testCase.invocation,scope.kinId,runtime);
+  assert.ok(calls.length>0,command);assert.deepEqual(testCase.calls,[scope.channelId,categoryId],command);
+  assert.equal(testCase.invocation.responses[0].flags,MessageFlags.Ephemeral);
+  for(const call of calls){assert.equal(call.resolved.contextType,'category',command);assert.equal(call.resolved.contextId,categoryId,command);assert.equal(call.resolved.storyline,scope.storyline,command);}
+ }
+});
+
+test('normal reply category retrieval agrees with slash scope and injects shared notes from a sibling channel',async()=>{
+ const added=categoryInteraction('add',{content:input.content,category:input.category});
+ await handleMemoryCommand(added.invocation,scope.kinId,{config:categoryConfig,store});
+ const sibling='888888888888888888';
+ const replyScope=resolveMemoryScope(categoryConfig,scope.kinId,scope.discordBotId,scope.guildId,sibling,{categoryId,isThread:false,categoryPermissionsSynced:true});
+ assert.equal(replyScope.contextType,'category');assert.equal(replyScope.contextId,categoryId);
+ const rows=await store.retrieve(replyScope,['promised']);assert.equal(rows.length,1);assert.equal(rows[0].content,input.content);
+ const outgoing=await supplementConversation(store,replyScope,recent,'Vincent promised');
+ assert.equal(outgoing.length,recent.length+1);assert.ok(outgoing[0].text.includes(input.content));assert.deepEqual(outgoing.slice(1),recent);
+});

@@ -24,6 +24,11 @@ No additional environment variables are required. Keep `DATABASE_URL`, stable `K
 
 Exact channel overrides still exclude category memory completely. Category inheritance
 requires synchronized permissions; threads do not inherit category memory. DMs remain excluded.
+Slash commands resolve exact mappings first. Category fallback fetches the invoking channel
+and parent category from Discord before checking membership and synchronized permissions,
+so an empty/stale interaction cache does not break category scope. All memory subcommands use
+this same resolution step. Fetch failure or unverifiable/unsynchronized permissions fail closed;
+channels with deliberately different audiences need an exact mapping.
 Visibility is an explicit production classification, not guessed from a Discord channel name.
 Review private categories too: category-scoped notes are intentionally shared with eligible
 channels in that category. Use exact mappings when audiences differ.
