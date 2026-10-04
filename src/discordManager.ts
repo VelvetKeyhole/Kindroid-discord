@@ -16,6 +16,7 @@ import { MemoryRuntime, handleMemoryCommand, registerMemoryCommands } from "./me
 import { resolveMemoryScope } from "./memoryConfig";
 import { supplementConversation } from "./memoryContext";
 import { MemoryExtractionWorker } from "./memoryExtraction";
+import { createMemoryDiagnostic, logMemoryDiagnostic } from "./memoryDiagnostics";
 
 //Bot back and forth (prevent infinite loop but allow for mentioning other bots in conversation)
 type BotConversationChain = {
@@ -266,7 +267,9 @@ async function createDiscordClientForBot(
             isThread: message.channel.isThread(),
             categoryPermissionsSynced: "permissionsLocked" in message.channel && message.channel.permissionsLocked === true,
           }) : undefined;
-        const supplemented = await supplementConversation(memory?.store, scope, conversationArray, message.content);
+        const diagnostic = createMemoryDiagnostic(botConfig.kinId);
+        const supplemented = await supplementConversation(memory?.store, scope, conversationArray, message.content, diagnostic);
+        logMemoryDiagnostic(diagnostic, supplemented);
         const aiResult = await callKindroidAI(
           botConfig.sharedAiCode,
           supplemented,
@@ -376,6 +379,7 @@ async function handleDirectMessage(
       );
 
       // Call Kindroid AI
+      logMemoryDiagnostic(createMemoryDiagnostic(botConfig.kinId), conversationArray);
       const aiResult = await callKindroidAI(
         botConfig.sharedAiCode,
         conversationArray,

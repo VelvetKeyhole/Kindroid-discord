@@ -88,6 +88,24 @@ empty registry rows are harmless and do not require cleanup before retrying.
 
 ## Visibility versus knowledge
 
+Temporary live diagnostics: set `MEMORY_DEBUG_ENABLED=true` on the bot service to emit one
+`[MEMORY_DIAG]` JSON line immediately before each normal Kindroid request. Unset or `false`
+emits no memory-debug lines. Each line has a short request ID, resolved scope/visibility,
+retrieval outcome, returned UUIDs, per-record eligibility/inclusion results, note/block counts,
+and the block's actual outgoing array index. It specifically flags test UUID
+`21e4ad40-d5d6-4cfb-9b44-d238223887be`. No memory text, message text, credentials, URLs,
+share codes or error objects are logged. Turn diagnostics off after the live test.
+
+Candidate count means rows returned by `retrieve()`, after SQL filtering and its five-row limit,
+not all stored records. SQL-excluded conflicts, expired/future notes and lower-ranked records
+are not returned and therefore cannot receive a per-record exclusion diagnosis here. Injection
+exclusions identify status, scope, privacy/knowledge/time, record limit or note budget. Visibility
+eligibility includes knowledge and expiry checks. Character count is the complete continuity
+block text (header plus notes), not the budget consumed by notes alone. A null candidate count
+means retrieval was skipped or failed; zero means retrieval ran and returned no rows. DMs have
+no resolved memory scope and show retrieval as not attempted. Existing generic failure warnings
+remain unchanged, independent of this diagnostic switch.
+
 `visibility`: public, private, confessional, or production.
 `knownByKinIds`: explicit stable character IDs, not display names.
 `knownAt`: ISO timestamp when this record's owning character learned the information.

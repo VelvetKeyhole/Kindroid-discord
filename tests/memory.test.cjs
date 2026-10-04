@@ -6,6 +6,7 @@ const { resolveMemoryScope, loadMemoryConfig } = require('../dist/memoryConfig')
 const { handleMemoryCommand, memoryCommandDefinition } = require('../dist/memoryCommands');
 const { MessageFlags } = require('discord.js');
 const { metadataFor, privacyEligible } = require('../dist/memoryPolicy');
+const { createMemoryDiagnostic, logMemoryDiagnostic } = require('../dist/memoryDiagnostics');
 
 const scope = { kinId: 'maya', storyline: 'villa-1', guildId: '11111111111111111', channelId: '22222222222222222', discordBotId: '33333333333333333' };
 const admin = '44444444444444444';
@@ -234,4 +235,91 @@ test('configuration requires stable unique kin IDs and unambiguous channel/story
     for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key];
     Object.assign(process.env, original);
   }
+});
+
+
+async function captureMemoryDiagnostics(enabled, work) {
+  const prior=process.env.MEMORY_DEBUG_ENABLED, originalInfo=console.info, originalWarn=console.warn, logs=[];
+  process.env.MEMORY_DEBUG_ENABLED=enabled;
+  console.info=line=>logs.push(line);console.warn=()=>{};
+  try { await work(logs); } finally {
+    console.info=originalInfo;console.warn=originalWarn;
+    if(prior===undefined)delete process.env.MEMORY_DEBUG_ENABLED;else process.env.MEMORY_DEBUG_ENABLED=prior;
+  }
+}
+const diagnosticScope={kinId:'vincent-villa',storyline:'villa-season-1',guildId:'111111111111111111',channelId:'1548814112673370272',discordBotId:'333333333333333333',visibility:'private'};
+const diagnosticId='21e4ad40-d5d6-4cfb-9b44-d238223887be';
+function diagnosticRow(overrides={}) {
+  return {...input,id:diagnosticId,content:'CONFIDENTIAL_MEMORY_TEXT',kin_id:diagnosticScope.kinId,storyline:diagnosticScope.storyline,guild_id:diagnosticScope.guildId,
+    context_id:diagnosticScope.channelId,context_type:'channel',active:true,status:'active',
+    metadata:metadataFor(diagnosticScope.kinId,{visibility:'private',knownAt:'2026-01-01T00:00:00Z',sourceSnapshot:'CONFIDENTIAL_SOURCE_TEXT'}),...overrides};
+}
+function parseDiagnostic(logs){assert.equal(logs.length,1);assert.match(logs[0],/^\[MEMORY_DIAG\] /);return JSON.parse(logs[0].slice('[MEMORY_DIAG] '.length));}
+
+test('memory diagnostics disabled produces no logs and leaves normal supplementation unchanged',async()=>{
+  await captureMemoryDiagnostics('false',async logs=>{
+    const diagnostic=createMemoryDiagnostic(diagnosticScope.kinId);assert.equal(diagnostic,undefined);
+    const outgoing=await supplementConversation({retrieve:async()=>[diagnosticRow()]},diagnosticScope,recent,'test',diagnostic);
+    logMemoryDiagnostic(diagnostic,outgoing);assert.equal(logs.length,0);assert.match(outgoing[0].text,/CONFIDENTIAL_MEMORY_TEXT/);
+  });
+});
+
+test('enabled diagnostics correlate the actual outgoing block and log no memory/message/source/credential text',async()=>{
+  await captureMemoryDiagnostics('true',async logs=>{
+    const messages=[{username:'CONFIDENTIAL_NAME',text:'CONFIDENTIAL_MESSAGE_TEXT',timestamp:'2026-10-04T12:00:00Z'}];
+    const rows=[diagnosticRow()],store={retrieve:async()=>rows};
+    const plain=await supplementConversation(store,diagnosticScope,messages,'SECRET_TRIGGER_TEXT');
+    const diagnostic=createMemoryDiagnostic(diagnosticScope.kinId);
+    const outgoing=await supplementConversation(store,diagnosticScope,messages,'SECRET_TRIGGER_TEXT',diagnostic);
+    assert.deepEqual(outgoing,plain);assert.deepEqual(outgoing.slice(1),messages);
+    logMemoryDiagnostic(diagnostic,outgoing);const entry=parseDiagnostic(logs);
+    assert.match(entry.requestId,/^[a-f0-9]{12}$/);assert.equal(entry.kinId,diagnosticScope.kinId);assert.equal(entry.storyline,diagnosticScope.storyline);
+    assert.equal(entry.contextType,'channel');assert.equal(entry.contextId,diagnosticScope.channelId);assert.equal(entry.visibility,'private');
+    assert.equal(entry.candidateCount,1);assert.deepEqual(entry.returnedMemoryUuids,[diagnosticId]);assert.equal(entry.testMemoryReturned,true);
+    assert.equal(entry.memories[0].included,true);assert.equal(entry.memories[0].exclusionReason,null);assert.equal(entry.injectedMemoryCount,1);
+    assert.equal(entry.continuityNoteCharacters,outgoing[0].text.length);assert.equal(entry.continuityBlockExists,true);assert.equal(entry.continuityBlockIndex,0);assert.equal(entry.outgoingConversationEntries,2);
+    for(const forbidden of ['CONFIDENTIAL_','SECRET_TRIGGER_TEXT','DATABASE_URL','sourceSnapshot','share_code','Authorization','discordBotId'])assert.ok(!logs[0].includes(forbidden));
+    logs.length=0;logMemoryDiagnostic(diagnostic,[messages[0],...outgoing]);assert.equal(parseDiagnostic(logs).continuityBlockIndex,1);
+    console.info=()=>{throw new Error('logger unavailable');};assert.doesNotThrow(()=>logMemoryDiagnostic(diagnostic,outgoing));
+  });
+});
+
+test('diagnostics explain returned-row status, scope, privacy, time and budget exclusions without changing filtering',async()=>{
+  await captureMemoryDiagnostics('true',async logs=>{
+    const privateMeta=diagnosticRow().metadata;
+    const rows=[diagnosticRow(),diagnosticRow({id:'00000000-0000-4000-8000-000000000001',active:false,status:'inactive'}),
+      diagnosticRow({id:'00000000-0000-4000-8000-000000000002',kin_id:'other-kin'}),
+      diagnosticRow({id:'00000000-0000-4000-8000-000000000003',metadata:{...privateMeta,visibility:'production'}}),
+      diagnosticRow({id:'00000000-0000-4000-8000-000000000004',metadata:{...privateMeta,knownAt:'2099-01-01T00:00:00Z'}}),
+      diagnosticRow({id:'00000000-0000-4000-8000-000000000005',metadata:{...privateMeta,expiresAt:'2026-01-02T00:00:00Z'}}),
+      diagnosticRow({id:'00000000-0000-4000-8000-000000000006',content:'x'.repeat(1000)}),
+      diagnosticRow({id:'00000000-0000-4000-8000-000000000007',content:'y'.repeat(1000)})];
+    const diagnostic=createMemoryDiagnostic(diagnosticScope.kinId),store={retrieve:async()=>rows};
+    const outgoing=await supplementConversation(store,diagnosticScope,recent,'test',diagnostic);
+    assert.deepEqual(outgoing,await supplementConversation(store,diagnosticScope,recent,'test'));
+    logMemoryDiagnostic(diagnostic,outgoing);const entry=parseDiagnostic(logs);
+    assert.deepEqual(entry.memories.map(m=>m.exclusionReason),[null,'status','scope','visibility','future knowledge','expired',null,'note budget']);
+    assert.equal(entry.injectedMemoryCount,2);assert.equal(entry.memories[1].activeStatusEligible,false);assert.equal(entry.memories[2].scopeEligible,false);
+    assert.equal(entry.memories[3].visibilityEligible,false);
+    logs.length=0;const limitDiagnostic=createMemoryDiagnostic(diagnosticScope.kinId);
+    const limited=await supplementConversation({retrieve:async()=>Array.from({length:6},(_,i)=>diagnosticRow({id:'00000000-0000-4000-8000-00000000000'+i}))},diagnosticScope,recent,'test',limitDiagnostic);
+    logMemoryDiagnostic(limitDiagnostic,limited);assert.equal(parseDiagnostic(logs).memories[5].exclusionReason,'record limit');
+  });
+});
+
+test('diagnostics distinguish empty, failed and skipped retrieval and preserve safe database fallback',async()=>{
+  await captureMemoryDiagnostics('true',async logs=>{
+    for(const [store,scopeValue,outcome,count] of [
+      [{retrieve:async()=>[]},diagnosticScope,'returned',0],
+      [{retrieve:async()=>{throw new Error('SECRET_DATABASE_URL_PASSWORD');}},diagnosticScope,'failed',null],
+      [undefined,undefined,'not attempted',null],
+    ]) {
+      logs.length=0;const diagnostic=createMemoryDiagnostic(diagnosticScope.kinId);
+      const outgoing=await supplementConversation(store,scopeValue,recent,'SECRET_MESSAGE',diagnostic);
+      assert.strictEqual(outgoing,recent);logMemoryDiagnostic(diagnostic,outgoing);
+      const entry=parseDiagnostic(logs);assert.equal(entry.retrievalOutcome,outcome);assert.equal(entry.candidateCount,count);
+      assert.equal(entry.continuityBlockExists,false);assert.equal(entry.continuityBlockIndex,null);assert.equal(entry.injectedMemoryCount,0);
+      assert.equal(entry.continuityNoteCharacters,0);assert.ok(!logs[0].includes('SECRET_'));
+    }
+  });
 });
