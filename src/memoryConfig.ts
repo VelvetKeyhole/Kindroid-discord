@@ -1,4 +1,5 @@
 import { BotConfig } from "./types";
+import { Visibility, visibilities } from "./memoryPolicy";
 
 export interface MemoryScope {
   kinId: string;
@@ -6,12 +7,36 @@ export interface MemoryScope {
   guildId: string;
   channelId: string;
   discordBotId: string;
+  contextType?: "channel" | "category";
+  contextId?: string;
+  visibility?: Visibility;
+}
+
+export interface MemoryContextMapping {
+  kinId: string;
+  storyline: string;
+  guildId: string;
+  channelId?: string;
+  categoryId?: string;
+  visibility?: Visibility;
+}
+
+export interface MemoryChannelOptions {
+  categoryId?: string | null;
+  isThread?: boolean;
+  categoryPermissionsSynced?: boolean;
+}
+
+export function resolvedContext(scope: MemoryScope): { type: "channel" | "category"; id: string } {
+  return { type: scope.contextType ?? "channel", id: scope.contextId ?? scope.channelId };
 }
 
 export interface MemoryConfig {
   enabled: boolean;
   adminUserIds: Set<string>;
-  contexts: Omit<MemoryScope, "discordBotId">[];
+  contexts: MemoryContextMapping[];
+  autoEnabled?: boolean;
+  autoChannelIds?: Set<string>;
 }
 
 const identifier = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -37,6 +62,12 @@ export function loadMemoryConfig(bots: BotConfig[]): MemoryConfig {
     throw new Error("MEMORY_ADMIN_USER_IDS must contain Discord user IDs");
   }
   config.adminUserIds = new Set(admins);
+  const autoValue = process.env.MEMORY_AUTO_ENABLED?.toLowerCase();
+  if (autoValue && !["true", "false"].includes(autoValue)) throw new Error("MEMORY_AUTO_ENABLED must be true or false");
+  config.autoEnabled = autoValue === "true";
+  const autoChannels = (process.env.MEMORY_AUTO_CHANNEL_IDS || "").split(",").map(id => id.trim()).filter(Boolean);
+  if (autoChannels.some(id => !snowflake.test(id))) throw new Error("MEMORY_AUTO_CHANNEL_IDS must contain Discord channel IDs");
+  config.autoChannelIds = new Set(autoChannels);
 
   // Temporary diagnostics: inspect the raw value without logging its contents.
   const raw = process.env.MEMORY_CONTEXTS;
@@ -67,26 +98,36 @@ export function loadMemoryConfig(bots: BotConfig[]): MemoryConfig {
   for (const entry of parsed as unknown[]) {
     if (!entry || typeof entry !== "object") throw new Error("Invalid memory context");
     const row = entry as Record<string, unknown>;
-    const { kinId, storyline, guildId, channelId } = row;
+    const { kinId, storyline, guildId, channelId, categoryId } = row;
+    if (row.visibility !== undefined && !visibilities.includes(row.visibility as Visibility)) throw new Error("Invalid context visibility");
     if (typeof kinId !== "string" || !kinIds.has(kinId) ||
         typeof storyline !== "string" || !identifier.test(storyline) ||
         typeof guildId !== "string" || !snowflake.test(guildId) ||
-        typeof channelId !== "string" || !snowflake.test(channelId)) {
-      throw new Error("Each memory context needs a configured kinId, storyline, guildId and channelId");
+        (channelId !== undefined && categoryId !== undefined) ||
+        (channelId === undefined && categoryId === undefined) ||
+        (channelId !== undefined && (typeof channelId !== "string" || !snowflake.test(channelId))) ||
+        (categoryId !== undefined && (typeof categoryId !== "string" || !snowflake.test(categoryId)))) {
+      throw new Error("Each memory context needs a configured kinId, storyline, guildId and exactly one channelId or categoryId");
     }
-    const key = `${kinId}:${guildId}:${channelId}`;
+    const key = `${kinId}:${guildId}:${channelId !== undefined ? "channel" : "category"}:${channelId ?? categoryId}`;
     if (locations.has(key)) throw new Error("Each kin/channel must map to exactly one storyline");
     locations.add(key);
-    config.contexts.push({ kinId, storyline, guildId, channelId });
+    config.contexts.push({ kinId, storyline, guildId, visibility: (row.visibility as Visibility) ?? 'public',
+      ...(channelId !== undefined ? { channelId: channelId as string } : { categoryId: categoryId as string }) });
   }
   return config;
 }
 
 export function resolveMemoryScope(
   config: MemoryConfig, kinId: string | undefined, discordBotId: string | undefined,
-  guildId: string | null, channelId: string
+  guildId: string | null, channelId: string, options: MemoryChannelOptions = {}
 ): MemoryScope | undefined {
   if (!config.enabled || !kinId || !discordBotId || !guildId) return undefined;
-  const context = config.contexts.find(c => c.kinId === kinId && c.guildId === guildId && c.channelId === channelId);
-  return context ? { ...context, discordBotId } : undefined;
+  const matches = config.contexts.filter(c => c.kinId === kinId && c.guildId === guildId);
+  const exact = matches.find(c => c.channelId === channelId);
+  if (exact) return { kinId, storyline: exact.storyline, guildId, channelId, discordBotId, contextType: "channel", contextId: channelId, visibility: exact.visibility ?? 'public' };
+  if (options.isThread || options.categoryPermissionsSynced !== true || !options.categoryId) return undefined;
+  const category = matches.find(c => c.categoryId === options.categoryId);
+  return category ? { kinId, storyline: category.storyline, guildId, channelId, discordBotId,
+    contextType: "category", contextId: options.categoryId, visibility: category.visibility ?? 'public' } : undefined;
 }

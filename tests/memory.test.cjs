@@ -5,6 +5,7 @@ const { supplementConversation } = require('../dist/memoryContext');
 const { resolveMemoryScope, loadMemoryConfig } = require('../dist/memoryConfig');
 const { handleMemoryCommand, memoryCommandDefinition } = require('../dist/memoryCommands');
 const { MessageFlags } = require('discord.js');
+const { metadataFor, privacyEligible } = require('../dist/memoryPolicy');
 
 const scope = { kinId: 'maya', storyline: 'villa-1', guildId: '11111111111111111', channelId: '22222222222222222', discordBotId: '33333333333333333' };
 const admin = '44444444444444444';
@@ -17,7 +18,10 @@ const recent = [{ username: 'Maya', text: 'What did Theo promise?', timestamp: '
 class ScopedDatabase {
   records = [];
   kins = new Map();
+  async connect() { return {query:this.query.bind(this),release(){}}; }
   async query(sql, values) {
+    if (['BEGIN','COMMIT','ROLLBACK'].includes(sql)) return {rows:[],rowCount:0};
+    if (sql.startsWith('SELECT auto_enabled FROM memory_contexts')) return {rows:[{auto_enabled:null}],rowCount:1};
     if (sql.startsWith('INSERT INTO memory_kins')) {
       assert.match(sql, /WHERE memory_kins.discord_bot_id = EXCLUDED.discord_bot_id/);
       const bound = this.kins.get(values[0]);
@@ -28,32 +32,38 @@ class ScopedDatabase {
     }
     if (sql.startsWith('INSERT INTO memory_contexts')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('INSERT INTO memories')) {
-      const [kin_id, storyline, guild_id, channel_id, id, content, category, tags, importance, user] = values;
-      const record = { kin_id, storyline, guild_id, channel_id, id, content, category, tags, importance, active: true,
+      const [kin_id, storyline, guild_id, context_id, context_type, id, content, category, tags, importance, user, source_channel_id] = values;
+      const record = { kin_id, storyline, guild_id, context_id, context_type, id, content, category, tags, importance, active: true, status: 'active', origin_kind: 'manual',
+        metadata:JSON.parse(values[12]),original_content:content,edit_version:'1',
+        source_channel_id, occurred_at: new Date(), source_message_ids: [], subjects: [], candidate_importance: null, confidence: null,
         created_by: user, updated_by: user, created_at: new Date(), updated_at: new Date() };
       this.records.push(record);
       return { rows: [{ ...record }], rowCount: 1 };
     }
-    assert.match(sql, /WHERE kin_id = \$1 AND storyline = \$2 AND guild_id = \$3 AND channel_id = \$4/);
-    assert.equal(values.slice(0, 4).every(Boolean), true);
-    let rows = this.records.filter(m => m.kin_id === values[0] && m.storyline === values[1] &&
-      m.guild_id === values[2] && m.channel_id === values[3]);
-    if (sql.includes('AND id')) rows = rows.filter(m => m.id === values[4]);
+    assert.match(sql, /WHERE kin_id = \$1 AND storyline = \$2 AND guild_id = \$3 AND context_id = \$4 AND context_type = \$5/);
+    assert.equal(values.slice(0, 5).every(Boolean), true);
+    let rows = this.records.filter(m => m.kin_id === values[0] && m.storyline === values[1] && m.guild_id === values[2] && m.context_id === values[3] && m.context_type === values[4]);
+    if (sql.includes('AND id')) rows = rows.filter(m => m.id === values[5]);
+    if (sql.includes("status <> 'archived'")) rows=rows.filter(m=>m.status!=='archived');
     if (sql.includes('active = true')) {
       assert.match(sql, /LIMIT 5/);
-      rows = rows.filter(m => m.active && (m.importance === 5 || values[4].some(term => m.content.toLowerCase().includes(term) || m.tags.includes(term))))
+      assert.match(sql, /status = 'active'/);
+      rows = rows.filter(m => privacyEligible(m.metadata,values[0],values[6]) && m.active && m.status === 'active' && (m.importance === 5 || values[5].some(term => m.content.toLowerCase().includes(term) || m.tags.includes(term))))
         .sort((a, b) => b.importance - a.importance).slice(0, 5);
     }
     if (sql.startsWith('UPDATE')) {
-      assert.match(sql, /updated_by=\$11/);
-      rows.forEach(m => Object.assign(m, { content: values[5], category: values[6], tags: values[7], importance: values[8], active: values[9], updated_by: values[10] }));
+      if (sql.includes("status='archived'")) {
+        rows.forEach(m=>Object.assign(m,{status:'archived',active:false}));
+        return {rows:rows.map(m=>({...m})),rowCount:rows.length};
+      }
+      assert.match(sql, /updated_by=\$12/);
+      rows.forEach(m => Object.assign(m, { content: values[6], category: values[7], tags: values[8], importance: values[9], active: values[10], status: values[10] ? 'active' : 'inactive', updated_by: values[11],metadata:JSON.parse(values[12]),edit_version:String(Number(m.edit_version)+1) }));
     }
     if (sql.startsWith('DELETE')) this.records = this.records.filter(m => !rows.includes(m));
-    if (sql.includes('OFFSET')) rows = rows.slice(values[4], values[4] + 10);
+    if (sql.includes('OFFSET')) rows = rows.slice(values[5], values[5] + 10);
     return { rows: rows.map(m => ({ ...m })), rowCount: rows.length };
   }
 }
-
 test('all CRUD operations isolate kin, storyline, guild and channel, even with a known UUID', async () => {
   const store = new MemoryStore(new ScopedDatabase());
   const saved = await store.add(scope, input, admin);
@@ -105,10 +115,10 @@ test('retrieval selects relevant active notes, caps results and leaves recent co
 });
 
 test('unexpected foreign or inactive records are never injected', async () => {
-  const base = { ...input, kin_id: scope.kinId, storyline: scope.storyline, guild_id: scope.guildId, channel_id: scope.channelId, active: true };
+  const base = { ...input, metadata:metadataFor(scope.kinId), kin_id: scope.kinId, storyline: scope.storyline, guild_id: scope.guildId, context_id: scope.channelId, context_type: 'channel', active: true, status: 'active' };
   const rows = [
     { ...base, kin_id: 'priya' }, { ...base, storyline: 'personal' },
-    { ...base, channel_id: 'another-channel' }, { ...base, guild_id: 'another-guild' }, { ...base, active: false },
+    { ...base, context_id: 'another-channel' }, { ...base, guild_id: 'another-guild' }, { ...base, active: false },
   ];
   const result = await supplementConversation({ retrieve: async () => rows }, scope, recent, 'Theo');
   assert.strictEqual(result, recent);
@@ -188,9 +198,10 @@ test('manual slash-command CRUD is ephemeral, scoped, and deletion requires conf
   const remove = interaction('delete', { id, confirm: true });
   await handleMemoryCommand(remove, scope.kinId, runtime);
   commands.push(remove);
-  assert.equal(db.records.length, 0);
+  assert.equal(db.records.length, 1);
+  assert.equal(db.records[0].status, 'archived');
   for (const current of commands) assert.equal(current.responses[0].flags, MessageFlags.Ephemeral);
-  assert.deepEqual(memoryCommandDefinition().toJSON().options.map(o => o.name), ['add', 'list', 'show', 'edit', 'delete']);
+  assert.deepEqual(memoryCommandDefinition().toJSON().options.slice(0, 5).map(o => o.name), ['add', 'list', 'show', 'edit', 'delete']);
 });
 
 test('command database errors remain private and expose no SQL or credentials', async () => {

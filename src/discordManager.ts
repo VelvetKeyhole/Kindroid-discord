@@ -15,6 +15,7 @@ import { BotConfig, DMConversationCount } from "./types";
 import { MemoryRuntime, handleMemoryCommand, registerMemoryCommands } from "./memoryCommands";
 import { resolveMemoryScope } from "./memoryConfig";
 import { supplementConversation } from "./memoryContext";
+import { MemoryExtractionWorker } from "./memoryExtraction";
 
 //Bot back and forth (prevent infinite loop but allow for mentioning other bots in conversation)
 type BotConversationChain = {
@@ -260,7 +261,11 @@ async function createDiscordClientForBot(
 
         // Call Kindroid AI with the conversation context
         const scope = memory ? resolveMemoryScope(memory.config, botConfig.kinId,
-          client.user?.id, message.guildId, message.channel.id) : undefined;
+          client.user?.id, message.guildId, message.channel.id, {
+            categoryId: "parentId" in message.channel ? message.channel.parentId : null,
+            isThread: message.channel.isThread(),
+            categoryPermissionsSynced: "permissionsLocked" in message.channel && message.channel.permissionsLocked === true,
+          }) : undefined;
         const supplemented = await supplementConversation(memory?.store, scope, conversationArray, message.content);
         const aiResult = await callKindroidAI(
           botConfig.sharedAiCode,
@@ -275,17 +280,31 @@ async function createDiscordClientForBot(
 
         // If it was a mention, reply to the message. Otherwise, send as normal message
         const replyChunks = splitDiscordMessage(aiResult.reply);
+        const replyIds: string[] = [];
+        let replyTimestamp = new Date().toISOString();
 
         for (let i = 0; i < replyChunks.length; i++) {
           if (isMentioned && i === 0) {
-            await message.reply(replyChunks[i]);
+            const sent = await message.reply(replyChunks[i]);
+            replyIds.push(sent.id);
+            replyTimestamp = sent.createdAt.toISOString();
           } else if (
             message.channel instanceof BaseGuildTextChannel ||
             message.channel instanceof DMChannel
           ) {
-            await message.channel.send(replyChunks[i]);
+            const sent = await message.channel.send(replyChunks[i]);
+            replyIds.push(sent.id);
+            replyTimestamp = sent.createdAt.toISOString();
           }
         }
+        // Scheduling is synchronous and does not wait for extraction or any database writes.
+        if (scope && replyIds.length && client.user) memory?.extractor?.schedule(scope, [
+          { authorId: message.author.id, authorName: message.author.globalName || message.author.username,
+            kind: message.author.bot ? "other-bot" : "user", text: message.content, guildId: scope.guildId,
+            channelId: message.channel.id, timestamp: message.createdAt.toISOString(), messageIds: [message.id] },
+          { authorId: client.user.id, authorName: client.user.username, kind: "kin", text: aiResult.reply,
+            guildId: scope.guildId, channelId: message.channel.id, timestamp: replyTimestamp, messageIds: replyIds.slice(0, 8) },
+        ]);
       } catch (error) {
         console.error(`[Bot ${botConfig.id}] Error:`, error);
         const errorMessage =
@@ -393,6 +412,7 @@ for (let i = 0; i < replyChunks.length; i++) {
  */
 async function initializeAllBots(botConfigs: BotConfig[], memory?: MemoryRuntime): Promise<Client[]> {
   console.log(`Initializing ${botConfigs.length} bots...`);
+  if (memory && !memory.extractor) memory.extractor = new MemoryExtractionWorker(memory.config, memory.store);
 
   const initPromises = botConfigs.map((config) =>
     createDiscordClientForBot(config, memory).catch((error) => {

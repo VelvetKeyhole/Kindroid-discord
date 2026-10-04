@@ -5,7 +5,10 @@ import { join } from "node:path";
 
 export interface Database {
   query<T extends QueryResultRow>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number | null }>;
+  connect?(): Promise<DatabaseConnection>;
 }
+
+export interface DatabaseConnection { query: Database["query"]; release(): void }
 
 export function createDatabase(): Pool {
   if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
@@ -48,7 +51,9 @@ function logMigrationFailure(stage: string, error: unknown): void {
 export async function migrateDatabase(pool: Pool): Promise<void> {
   let stage = "read-migration-file";
   try {
-    const sql = await readFile(join(__dirname, "../migrations/001_memory.sql"), "utf8");
+    const migrations = await Promise.all(["001_memory", "002_category_candidates", "003_memory_governance"].map(async id => ({
+      id, sql: await readFile(join(__dirname, `../migrations/${id}.sql`), "utf8"),
+    })));
     stage = "connect-database";
     const client = await pool.connect();
     try {
@@ -58,13 +63,15 @@ export async function migrateDatabase(pool: Pool): Promise<void> {
       await client.query("SELECT pg_advisory_xact_lock(618034251)");
       stage = "create-migration-tracker";
       await client.query("CREATE TABLE IF NOT EXISTS memory_schema_migrations (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
-      stage = "check-migration-record";
-      const existing = await client.query("SELECT id FROM memory_schema_migrations WHERE id = $1", ["001_memory"]);
-      if (!existing.rowCount) {
-        stage = "execute-memory-schema";
-        await client.query(sql);
-        stage = "record-migration";
-        await client.query("INSERT INTO memory_schema_migrations (id) VALUES ($1)", ["001_memory"]);
+      for (const migration of migrations) {
+        stage = `check-migration-record:${migration.id}`;
+        const existing = await client.query("SELECT id FROM memory_schema_migrations WHERE id = $1", [migration.id]);
+        if (!existing.rowCount) {
+          stage = `execute-memory-schema:${migration.id}`;
+          await client.query(migration.sql);
+          stage = `record-migration:${migration.id}`;
+          await client.query("INSERT INTO memory_schema_migrations (id) VALUES ($1)", [migration.id]);
+        }
       }
       stage = "commit-transaction";
       await client.query("COMMIT");

@@ -1,6 +1,7 @@
-import { MemoryScope } from "./memoryConfig";
+import { MemoryScope, resolvedContext } from "./memoryConfig";
 import { MemoryRecord, MemoryStore } from "./memoryStore";
 import { ConversationMessage } from "./types";
+import { privacyEligible } from "./memoryPolicy";
 
 const stopWords = new Set(["this", "that", "with", "have", "what", "your", "from", "they", "them", "about", "would", "could", "please", "there", "their", "just"]);
 export function memorySearchTerms(text: string): string[] {
@@ -17,12 +18,13 @@ export async function supplementConversation(
     const terms = memorySearchTerms(`${triggeringText} ${recent.slice(-5).map(m => m.text).join(" ")}`);
     const rows = await store.retrieve(scope, terms);
     // Defense in depth: never inject an unexpected scope, even if a query regresses.
-    const eligible = rows.filter((m: MemoryRecord) => m.active && m.kin_id === scope.kinId &&
-      m.storyline === scope.storyline && m.guild_id === scope.guildId && m.channel_id === scope.channelId).slice(0, 5);
+    const context = resolvedContext(scope);
+    const eligible = rows.filter((m: MemoryRecord) => privacyEligible(m.metadata, scope.kinId, scope.visibility) && m.active && m.status === "active" && m.kin_id === scope.kinId &&
+      m.storyline === scope.storyline && m.guild_id === scope.guildId && m.context_id === context.id && m.context_type === context.type).slice(0, 5);
     const notes: string[] = [];
     let remaining = 2000;
     for (const memory of eligible) {
-      const note = `- [${memory.category}] ${memory.content.replace(/\s+/g, " ").trim()}`;
+      const note = `- [${memory.category}; ${memory.metadata.statementType}; ${memory.metadata.memoryType}; known since ${memory.metadata.knownAt}] ${memory.content.replace(/\s+/g, " ").trim()}`;
       if (note.length > remaining) continue;
       notes.push(note);
       remaining -= note.length + 1;
