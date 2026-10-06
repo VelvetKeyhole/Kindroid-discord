@@ -158,11 +158,15 @@ Existing `channelId` mappings keep their exact-channel behavior. A new mapping c
 
 ```json
 [{"kinId":"maya-villa","storyline":"villa-season-1","guildId":"SERVER_ID","categoryId":"CATEGORY_ID"},
- {"kinId":"maya-villa","storyline":"private-scene","guildId":"SERVER_ID","channelId":"PRIVATE_CHANNEL_ID"}]
+ {"kinId":"maya-villa","storyline":"private-scene","guildId":"SERVER_ID","channelId":"PRIVATE_CHANNEL_ID","visibility":"private"}]
 ```
 
 Replace the placeholders with numeric Discord IDs. An exact channel mapping always wins
-and excludes the category's memory entirely, even when both point to the same storyline.
+for writes and administration. Exact private/confessional replies and snapshots additionally
+inherit the unique public base for that same kin/storyline/server. The different-storyline
+example above intentionally stays isolated. Public exact channels never inherit other scopes.
+See the [layered retrieval configuration](docs/memory-production.md#layered-public-knowledge)
+for a shared Villa plus private/confessional setup; missing/ambiguous bases remain local-only.
 Category fallback requires permissions synchronized with that category. Channels with their
 own permissions (including private overrides) need an exact mapping. This is deliberately
 restrictive: a private/confessional channel must not contribute to a wider category pool.

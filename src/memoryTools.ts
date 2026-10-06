@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createDatabase } from './database';
-import { loadMemoryConfig, MemoryScope, resolvedContext } from './memoryConfig';
+import { loadMemoryConfig, MemoryScope, resolvedContext, withPublicBase } from './memoryConfig';
 import { MemoryStore } from './memoryStore';
 import { MemoryBundle, MemoryProduction, readableCanon, exportSafetyWarning } from './memoryProduction';
 import { BotConfig } from './types';
@@ -21,7 +21,7 @@ export async function runMemoryTool(requestPath: string, outputPath: string): Pr
   const mapping = config.contexts.find(c=>c.kinId===request.scope.kinId && c.storyline===request.scope.storyline && c.guildId===request.scope.guildId &&
     (context.type==='channel' ? c.channelId===context.id : c.categoryId===context.id));
   if (!mapping) throw new Error('Unconfigured production scope');
-  const scope = { ...request.scope,visibility:mapping.visibility ?? 'public' };
+  const scope = withPublicBase(config, { ...request.scope,visibility:mapping.visibility ?? 'public' });
   const database = createDatabase();
   try {
     const store = new MemoryStore(database), production = new MemoryProduction(store);

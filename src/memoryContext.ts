@@ -1,7 +1,7 @@
-import { MemoryScope, resolvedContext } from "./memoryConfig";
+import { MemoryScope } from "./memoryConfig";
 import { MemoryRecord, MemoryStore } from "./memoryStore";
 import { ConversationMessage } from "./types";
-import { privacyEligible } from "./memoryPolicy";
+import { memoryScopeEligible, memoryLayerPrivacyEligible } from './memoryLayers';
 import { MemoryDiagnostic, recordMemoryCandidates } from "./memoryDiagnostics";
 
 const stopWords = new Set(["this", "that", "with", "have", "what", "your", "from", "they", "them", "about", "would", "could", "please", "there", "their", "just"]);
@@ -16,13 +16,14 @@ export async function supplementConversation(
 ): Promise<ConversationMessage[]> {
   if (diagnostic) diagnostic.scope = scope;
   if (!store || !scope || !recent.length) return recent;
+  if (scope.publicBaseStatus === 'missing' || scope.publicBaseStatus === 'ambiguous') {
+    console.warn(`Public memory base ${scope.publicBaseStatus}; using only the current local scope.`);
+  }
   try {
     const terms = memorySearchTerms(`${triggeringText} ${recent.slice(-5).map(m => m.text).join(" ")}`);
     const rows = await store.retrieve(scope, terms);
     // Defense in depth: never inject an unexpected scope, even if a query regresses.
-    const context = resolvedContext(scope);
-    const eligible = rows.filter((m: MemoryRecord) => privacyEligible(m.metadata, scope.kinId, scope.visibility) && m.active && m.status === "active" && m.kin_id === scope.kinId &&
-      m.storyline === scope.storyline && m.guild_id === scope.guildId && m.context_id === context.id && m.context_type === context.type).slice(0, 5);
+    const eligible = rows.filter((m: MemoryRecord) => memoryScopeEligible(scope,m) && memoryLayerPrivacyEligible(scope,m) && m.active && m.status === "active").slice(0, 5);
     const notes: string[] = [];
     const included = diagnostic ? new Set<MemoryRecord>() : undefined;
     let remaining = 2000;

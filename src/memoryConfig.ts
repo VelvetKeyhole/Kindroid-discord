@@ -10,6 +10,22 @@ export interface MemoryScope {
   contextType?: "channel" | "category";
   contextId?: string;
   visibility?: Visibility;
+  publicBase?: { contextType: "channel" | "category"; contextId: string };
+  publicBaseStatus?: "configured" | "missing" | "ambiguous";
+}
+
+export function withPublicBase(config: MemoryConfig, scope: MemoryScope): MemoryScope {
+  const local = { ...scope };
+  delete local.publicBase;
+  delete local.publicBaseStatus;
+  if (resolvedContext(local).type !== 'channel' || !['private','confessional'].includes(local.visibility ?? 'public')) return local;
+  const matches = config.contexts.filter(c => c.kinId === local.kinId && c.storyline === local.storyline &&
+    c.guildId === local.guildId && (c.visibility ?? 'public') === 'public');
+  if (matches.length !== 1) return { ...local, publicBaseStatus: matches.length ? 'ambiguous' : 'missing' };
+  const mapping = matches[0];
+  return { ...local, publicBaseStatus: 'configured', publicBase: mapping.categoryId
+    ? { contextType: 'category', contextId: mapping.categoryId }
+    : { contextType: 'channel', contextId: mapping.channelId! } };
 }
 
 export interface MemoryContextMapping {
@@ -125,7 +141,7 @@ export function resolveMemoryScope(
   if (!config.enabled || !kinId || !discordBotId || !guildId) return undefined;
   const matches = config.contexts.filter(c => c.kinId === kinId && c.guildId === guildId);
   const exact = matches.find(c => c.channelId === channelId);
-  if (exact) return { kinId, storyline: exact.storyline, guildId, channelId, discordBotId, contextType: "channel", contextId: channelId, visibility: exact.visibility ?? 'public' };
+  if (exact) return withPublicBase(config, { kinId, storyline: exact.storyline, guildId, channelId, discordBotId, contextType: "channel", contextId: channelId, visibility: exact.visibility ?? 'public' });
   if (options.isThread || options.categoryPermissionsSynced !== true || !options.categoryId) return undefined;
   const category = matches.find(c => c.categoryId === options.categoryId);
   return category ? { kinId, storyline: category.storyline, guildId, channelId, discordBotId,

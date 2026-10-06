@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { MemoryScope, resolvedContext } from './memoryConfig';
 import { MemoryInput, MemoryRecord, MemoryStore, normalizedMemory, substantiallyMatches, validateMemory } from './memoryStore';
 import { MemoryMetadata, metadataFor, privacyEligible, authority, conflictHint } from './memoryPolicy';
+import { hasPublicLayer } from './memoryLayers';
 
 export interface ImportItem extends MemoryInput { id?: string; externalId?: string;
   source_channel_id?: string | null; occurred_at?: string | Date | null; source_message_ids?: string[];
@@ -38,7 +39,7 @@ export function readableCanon(scope: MemoryScope, rows: MemoryRecord[]): string 
   return `${scope.kinId} — ${scope.storyline} — Current Canon\nContext: ${resolvedContext(scope).type}:${resolvedContext(scope).id}\n\n`+
     groups.map(type=>{
       const notes=rows.filter(m=>m.metadata.memoryType===type);
-      return notes.length ? `${type.toUpperCase()}\n${notes.map(m=>`- ${m.metadata.pinned?'[pinned] ':''}[${m.metadata.statementType}] ${m.content}`).join('\n')}` : '';
+      return notes.length ? `${type.toUpperCase()}\n${notes.map(m=>`- [${m.context_type}:${m.context_id}] ${m.metadata.pinned?'[pinned] ':''}[${m.metadata.statementType}] ${m.content}`).join('\n')}` : '';
     }).filter(Boolean).join('\n\n');
 }
 export function bundleScope(scope: MemoryScope): MemoryBundle['scope'] {
@@ -167,6 +168,7 @@ export class MemoryProduction {
   }
 
   async snapshot(scope: MemoryScope): Promise<MemoryRecord[]> {
+    if (hasPublicLayer(scope)) return this.store.layeredSnapshot(scope);
     const rows = (await this.all(scope)).filter(m=>m.status==='active' && privacyEligible(m.metadata,scope.kinId,scope.visibility));
     const ids = new Set(rows.map(m=>m.id));
     const conflicts = await this.store.conflicts(scope);

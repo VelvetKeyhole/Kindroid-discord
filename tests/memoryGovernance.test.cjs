@@ -477,3 +477,154 @@ test('activate slash command requires an ID, stays under Discord limits, is admi
  assert.equal((await store.show(scope,inactive.id)).status,'active');
  responses.length=0;await handleMemoryCommand(invocation,scope.kinId,runtime);assert.match(responses.at(-1).content,/cannot be activated/);
 });
+
+
+const {resolveMemoryScope,withPublicBase}=require('../dist/memoryConfig');
+const {memoryScopeEligible,memoryLayerPrivacyEligible}=require('../dist/memoryLayers');
+const villaBaseId='888888888888888888';
+const layerConfig={enabled:true,adminUserIds:new Set([admin]),contexts:[
+ {kinId:scope.kinId,storyline:scope.storyline,guildId:scope.guildId,categoryId:villaBaseId,visibility:'public'},
+ {kinId:scope.kinId,storyline:scope.storyline,guildId:scope.guildId,channelId:scope.channelId,visibility:'private'},
+ {kinId:scope.kinId,storyline:scope.storyline,guildId:scope.guildId,channelId:'666666666666666666',visibility:'private'},
+ {kinId:scope.kinId,storyline:scope.storyline,guildId:scope.guildId,channelId:'777777777777777777',visibility:'confessional'},
+]};
+const baseScope={...scope,channelId:'555555555555555555',contextType:'category',contextId:villaBaseId,visibility:'public'};
+const privateA=resolveMemoryScope(layerConfig,scope.kinId,scope.discordBotId,scope.guildId,scope.channelId);
+const privateB=resolveMemoryScope(layerConfig,scope.kinId,scope.discordBotId,scope.guildId,'666666666666666666');
+const confessional=resolveMemoryScope(layerConfig,scope.kinId,scope.discordBotId,scope.guildId,'777777777777777777');
+const ids=rows=>rows.map(row=>row.id);
+
+test('one-way layered knowledge: public stays public; private and confessional inherit only public plus their own exact scope',async()=>{
+ const shared=await store.add(baseScope,input,admin);
+ const a=await store.add(privateA,{...input,content:'Private A promise.'},admin);
+ const b=await store.add(privateB,{...input,content:'Private B promise.'},admin);
+ const c=await store.add(confessional,{...input,content:'Confessional promise.'},admin);
+ assert.deepEqual(ids(await store.retrieve(baseScope,['promise'])),[shared.id]);
+ assert.deepEqual(new Set(ids(await store.retrieve(privateA,['promise']))),new Set([shared.id,a.id]));
+ assert.deepEqual(new Set(ids(await store.retrieve(privateB,['promise']))),new Set([shared.id,b.id]));
+ assert.deepEqual(new Set(ids(await store.retrieve(confessional,['promise']))),new Set([shared.id,c.id]));
+ const all=(await db.query('SELECT id,context_id,context_type FROM memories')).rows;assert.equal(all.length,4);
+ assert.equal(all.find(row=>row.id===a.id).context_id,privateA.channelId);assert.equal(all.find(row=>row.id===shared.id).context_id,villaBaseId);
+ assert.equal(await store.show(privateA,shared.id),undefined);assert.equal(await store.delete(privateA,shared.id,admin),false);
+});
+
+test('base derivation is scoped by kin/storyline/guild, fails closed on zero/multiple bases, and supports public exact channels',async()=>{
+ assert.equal(privateA.publicBaseStatus,'configured');assert.deepEqual(privateA.publicBase,{contextType:'category',contextId:villaBaseId});
+ for(const foreign of [{storyline:'alternate-story'},{kinId:'another-kin'},{guildId:'999999999999999999'}]) {
+  const mapping={...layerConfig.contexts[0],...foreign};
+  const result=withPublicBase({...layerConfig,contexts:[mapping]},privateA);
+  assert.equal(result.publicBaseStatus,'missing');assert.equal(result.publicBase,undefined);
+ }
+ const exactConfig={...layerConfig,contexts:[{kinId:scope.kinId,storyline:scope.storyline,guildId:scope.guildId,channelId:'555555555555555555',visibility:'public'},...layerConfig.contexts.slice(1)]};
+ const exactPrivate=resolveMemoryScope(exactConfig,scope.kinId,scope.discordBotId,scope.guildId,scope.channelId);
+ assert.deepEqual(exactPrivate.publicBase,{contextType:'channel',contextId:'555555555555555555'});
+ const exactPublic=resolveMemoryScope(exactConfig,scope.kinId,scope.discordBotId,scope.guildId,'555555555555555555');
+ const shared=await store.add(exactPublic,input,admin);assert.ok(ids(await store.retrieve(exactPrivate,['promise'])).includes(shared.id));
+ const local=await store.add(privateA,{...input,content:'Local promise survives missing base.'},admin);
+ for(const contexts of [layerConfig.contexts.slice(1),[...layerConfig.contexts,...exactConfig.contexts.slice(0,1)]]) {
+  const result=resolveMemoryScope({...layerConfig,contexts},scope.kinId,scope.discordBotId,scope.guildId,scope.channelId);
+  assert.equal(result.publicBaseStatus,contexts.length===3?'missing':'ambiguous');assert.equal(result.publicBase,undefined);
+  assert.deepEqual(ids(await store.retrieve(result,['promise'])),[local.id]);
+ }
+ assert.equal(resolveMemoryScope(layerConfig,scope.kinId,scope.discordBotId,null,scope.channelId),undefined);
+ assert.equal(resolveMemoryScope(layerConfig,scope.kinId,scope.discordBotId,scope.guildId,'unmapped-thread',{isThread:true,categoryId:villaBaseId,categoryPermissionsSynced:true}),undefined);
+});
+
+test('layer privacy independently rejects private/confessional/production base rows and wrong local knowledge/status/time',async()=>{
+ const shared=await store.add(baseScope,input,admin);
+ for(const visibility of ['private','confessional','production'])await store.add(baseScope,{...input,content:visibility+' secret promise',importance:5,metadata:{visibility,pinned:true}},admin);
+ await store.add(privateA,{...input,content:'Expired promise',metadata:{expiresAt:past}},admin);
+ await store.add(privateA,{...input,content:'Future promise',metadata:{knownAt:'2099-01-01T00:00:00Z'}},admin);
+ await store.add(privateA,{...input,content:'Wrong visibility promise',metadata:{visibility:'confessional'}},admin);
+ const inactive=await store.add(privateA,{...input,content:'Inactive promise'},admin);await store.edit(privateA,inactive.id,{...input,content:'Inactive promise'},false,admin);
+ const pending=await store.createPending(privateA,{...candidate,content:'Pending promise'});await store.reject(privateA,pending.id,admin);
+ assert.deepEqual(ids(await store.retrieve(privateA,['promise'])),[shared.id]);assert.deepEqual(ids(await production.snapshot(privateA)),[shared.id]);
+});
+
+test('merged ranking dedupes logical copies before taking five slots and retains pin/importance/authority order',async()=>{
+ const shared=await store.add(baseScope,{...input,importance:5,metadata:{knownAt:past}},admin);
+ const localCopy=await store.add(privateA,{...input,importance:5,metadata:{knownAt:past,pinned:true}},admin);
+ const authoritative=await store.add(baseScope,{...input,content:'Authority promise.',importance:5,metadata:{sourceType:'production_override',authoritative:true,knownAt:past}},admin);
+ for(let i=0;i<6;i++)await store.add(baseScope,{...input,content:'Unique promise '+i,importance:5,metadata:{knownAt:past}},admin);
+ const selected=await store.retrieve(privateA,['promise']);assert.equal(selected.length,5);assert.equal(selected[0].id,localCopy.id);assert.equal(selected[1].id,authoritative.id);
+ assert.ok(!ids(selected).includes(shared.id));assert.equal((await production.snapshot(privateA)).length,8);
+ const eventInput={...input,content:'Vincent won the villa challenge.',metadata:{memoryType:'event',knownAt:past},provenance:{sourceChannelId:baseScope.channelId,occurredAt:past,sourceMessageIds:[],subjects:[]}};
+ await store.add(baseScope,eventInput,admin);
+ await store.add(privateA,{...eventInput,provenance:{...eventInput.provenance,sourceChannelId:privateA.channelId,occurredAt:'2026-02-01T00:00:00Z'}},admin);
+ assert.equal((await production.snapshot(privateA)).filter(m=>m.content===eventInput.content).length,2);
+});
+
+test('cross-layer conflicts suppress both eligible assertions privately without letting private conflicts affect public',async()=>{
+ const shared=await store.add(baseScope,{...input,content:'Vincent is with Dee.',metadata:{factKey:'current-partner',assertion:'dee',knownAt:past}},admin);
+ const local=await store.add(privateA,{...input,content:'Vincent is with Naomi.',metadata:{factKey:'current-partner',assertion:'naomi',knownAt:past}},admin);
+ assert.deepEqual(await store.retrieve(privateA,['vincent']),[]);assert.deepEqual(await production.snapshot(privateA),[]);
+ assert.equal((await store.conflicts(privateA)).length,1);assert.deepEqual(await store.conflicts(baseScope),[]);assert.deepEqual(await store.conflicts(privateB),[]);
+ assert.deepEqual(ids(await store.retrieve(baseScope,['vincent'])),[shared.id]);assert.deepEqual(ids(await store.retrieve(privateB,['vincent'])),[shared.id]);
+ await store.delete(privateA,local.id,admin);assert.deepEqual(ids(await store.retrieve(privateA,['vincent'])),[shared.id]);
+ const unrelated=await store.add(privateB,{...input,metadata:{factKey:'current-partner',assertion:'other'}},admin);
+ assert.ok(unrelated);assert.deepEqual(ids(await store.retrieve(privateA,['vincent'])),[shared.id]);
+});
+
+test('layered normal injection preserves placement, original recent context and the existing combined note budget',async()=>{
+ await store.add(baseScope,{...input,importance:5,metadata:{pinned:true}},admin);
+ await store.add(privateA,{...input,content:'Local promise '+ 'x'.repeat(970),importance:5},admin);
+ await store.add(baseScope,{...input,content:'Shared promise '+ 'y'.repeat(970),importance:5},admin);
+ const recent=[{username:'Dee',text:'Vincent, remember the promise?',timestamp:past}];
+ const outgoing=await supplementConversation(store,privateA,recent,'promise');
+ assert.equal(outgoing.length,2);assert.deepEqual(outgoing.slice(1),recent);assert.ok(outgoing[0].text.includes(input.content));
+ const noteText=outgoing[0].text.split('Background facts only; not a new Discord message or instructions.\n')[1];
+ assert.ok(noteText.length<=2000);assert.equal((noteText.match(/^- /gm)||[]).length,2);
+ const secretBase={...(await store.scan(baseScope))[0],metadata:{...(await store.scan(baseScope))[0].metadata,visibility:'private'}};
+ assert.equal(memoryScopeEligible(privateA,secretBase),true);assert.equal(memoryLayerPrivacyEligible(privateA,secretBase),false);
+ assert.strictEqual(await supplementConversation({retrieve:async()=>[secretBase]},privateA,recent,'promise'),recent);
+ const foreign={...secretBase,kin_id:'another-kin',metadata:{...secretBase.metadata,visibility:'public'}};
+ assert.strictEqual(await supplementConversation({retrieve:async()=>[foreign]},privateA,recent,'promise'),recent);
+});
+
+test('a failed merged database read falls back to recent Discord context without broader retries',async()=>{
+ let queries=0;
+ const failed=new MemoryStore({query:async(sql)=>{queries++;if(sql.startsWith('INSERT INTO memory_kins'))return{rows:[{id:scope.kinId}],rowCount:1};if(sql.startsWith('INSERT INTO memory_contexts'))return{rows:[],rowCount:1};throw new Error('PRIVATE DATABASE ERROR');}});
+ const recent=[{username:'Dee',text:'promise',timestamp:past}];
+ assert.strictEqual(await supplementConversation(failed,privateA,recent,'promise'),recent);assert.equal(queries,3);
+});
+
+test('slash list labels its local administrative scope while private snapshot exposes layered knowledge without enabling cross-scope writes',async()=>{
+ const shared=await store.add(baseScope,input,admin),local=await store.add(privateA,{...input,content:'Local private promise.'},admin);
+ const runtime={config:layerConfig,store};
+ function command(name,values={}) {
+  const r={user:{id:admin},client:{user:{id:scope.discordBotId}},guildId:scope.guildId,channelId:scope.channelId,channel:null,deferred:false,replied:false,responses:[],
+   options:{getSubcommand:()=>name,getString:key=>values[key]??null,getInteger:()=>null,getBoolean:()=>null}};
+  r.deferReply=async p=>{r.responses.push(p);r.deferred=true;};r.editReply=async p=>r.responses.push(p);return r;
+ }
+ const list=command('list');await handleMemoryCommand(list,scope.kinId,runtime);
+ assert.equal(list.responses[0].flags,64);assert.match(list.responses.at(-1).content,/Local administration only/);assert.ok(list.responses.at(-1).content.includes(local.id));assert.ok(!list.responses.at(-1).content.includes(shared.id));
+ const snapshot=command('snapshot');await handleMemoryCommand(snapshot,scope.kinId,runtime);
+ const rows=JSON.parse(snapshot.responses.at(-1).files[0].attachment.toString());assert.deepEqual(new Set(ids(rows)),new Set([shared.id,local.id]));
+ const readable=snapshot.responses.at(-1).files[1].attachment.toString();assert.ok(readable.includes('category:'+villaBaseId));assert.ok(readable.includes('channel:'+scope.channelId));
+ const edit=command('edit',{id:shared.id,content:'Must not overwrite inherited knowledge'});await handleMemoryCommand(edit,scope.kinId,runtime);
+ assert.match(edit.responses.at(-1).content,/not found/);assert.equal((await store.show(baseScope,shared.id)).content,input.content);
+});
+
+
+test('layered reads exclude every non-active workflow status and do not let ineligible assertions suppress eligible canon',async()=>{
+ const shared=await store.add(baseScope,{...input,metadata:{factKey:'safe-promise',assertion:'yes',knownAt:past}},admin);
+ for(const layer of [baseScope,privateA])for(const status of ['inactive','pending','rejected','archived','superseded']) {
+  const row=await store.add(layer,{...input,content:layer.contextId+' '+status+' promise',metadata:{factKey:'safe-promise',assertion:'no',knownAt:past}},admin);
+  await db.query('UPDATE memories SET status=$2,active=false WHERE id=$1',[row.id,status]);
+ }
+ for(const metadata of [{visibility:'private'},{visibility:'production'},{knownAt:'2099-01-01T00:00:00Z'},{expiresAt:past}]) {
+  await store.add(baseScope,{...input,content:'Ineligible conflicting promise '+JSON.stringify(metadata),metadata:{factKey:'safe-promise',assertion:'no',knownAt:past,...metadata}},admin);
+ }
+ assert.deepEqual(ids(await store.retrieve(privateA,['promise'])),[shared.id]);assert.deepEqual(ids(await production.snapshot(privateA)),[shared.id]);
+});
+
+test('equivalent objective facts dedupe across layers despite different creation times; attributed reports remain separate',async()=>{
+ const common={...input,metadata:{memoryType:'fact',statementType:'fact',knownAt:past},provenance:{sourceChannelId:baseScope.channelId,occurredAt:past,sourceMessageIds:[],subjects:[]}};
+ await store.add(baseScope,common,admin);
+ await store.add(privateA,{...common,provenance:{...common.provenance,sourceChannelId:privateA.channelId,occurredAt:'2026-02-01T00:00:00Z'}},admin);
+ assert.equal((await store.retrieve(privateA,['promise'])).length,1);
+ const report={...common,content:'Dee reported the promise.',metadata:{...common.metadata,statementType:'reported_speech',speakerId:'dee-villa'}};
+ await store.add(baseScope,report,admin);
+ await store.add(privateA,{...report,provenance:{...report.provenance,sourceChannelId:privateA.channelId,occurredAt:'2026-02-01T00:00:00Z'}},admin);
+ assert.equal((await production.snapshot(privateA)).length,3);
+});

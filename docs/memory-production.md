@@ -22,7 +22,9 @@ No additional environment variables are required. Keep `DATABASE_URL`, stable `K
 ]
 ```
 
-Exact channel overrides still exclude category memory completely. Category inheritance
+Exact channel overrides select the local write/admin scope. Public exact channels still exclude
+other scopes; private/confessional exact channels can inherit the unique public base described
+below. Category membership inheritance
 requires synchronized permissions; threads do not inherit category memory. DMs remain excluded.
 Slash commands resolve exact mappings first. Category fallback fetches the invoking channel
 and parent category from Discord before checking membership and synchronized permissions,
@@ -93,6 +95,57 @@ empty registry rows are harmless and do not require cleanup before retrying.
 
 ## Visibility versus knowledge
 
+### Layered public knowledge
+
+For an exact private/confessional mapping, the public base is derived from `MEMORY_CONTEXTS`:
+exactly one public mapping must match the same stable kin ID, storyline and server. Omitted
+visibility means public. The base may be a category or exact channel. No new environment
+variable, copying or cross-scope write is involved. Example (repeat for each kin as needed):
+
+```json
+[
+  {"kinId":"vincent-villa","storyline":"villa-season-1","guildId":"SERVER_ID","categoryId":"VILLA_CATEGORY_ID","visibility":"public"},
+  {"kinId":"vincent-villa","storyline":"villa-season-1","guildId":"SERVER_ID","channelId":"PRIVATE_CHANNEL_ID","visibility":"private"},
+  {"kinId":"vincent-villa","storyline":"villa-season-1","guildId":"SERVER_ID","channelId":"CONFESSIONAL_CHANNEL_ID","visibility":"confessional"}
+]
+```
+
+Only active, eligible **public** rows from the base are inherited. Local rows must satisfy the
+current private/confessional visibility and existing knowledge/time rules. Private A never
+inherits private B; confessional never inherits unrelated private records. Public and production
+requests never add a base layer. DMs remain unsupported; threads still need exact mappings.
+An explicitly configured private/confessional thread can use the same one-way public base.
+
+If zero or multiple public mappings match, only local knowledge is used and a safe warning is
+reported. `/memory list` and `/memory snapshot` state the base resolution status. Public mappings
+for another storyline/server/kin cannot serve as a substitute. Having both a public category
+and a public exact override in the same kin/storyline/server is ambiguous; consolidate the
+public base mapping or accept local-only private retrieval. Never guess a base by display name.
+
+Replies and snapshots share a merged SQL path: independent layer privacy filters, cross-layer
+conflict suppression, conservative logical deduplication, then global pin/importance/authority/
+update-time ranking. Conflicts use existing explicit `factKey`/`assertion`; both conflicting
+eligible records are suppressed in the private view, while private conflicts cannot influence
+public retrieval. Deduplication requires exact case/whitespace-normalized full text and matching
+category/type/statement/domain/speaker/conflict/expiry semantics; dated events and attributed
+statements retain occurrence/subject distinctions. Paraphrases are not automatically merged.
+The highest-ranked eligible representative wins; stored originals/history are untouched.
+
+Reply selection remains five notes across both layers with the existing 2000-character note
+budget and unchanged keyword matching/prompt position. Snapshots have no keyword/five-note
+budget and remain capped for production/Discord output. Their JSON retains source context IDs;
+readable snapshots label each source scope. `/memory list` remains a **local administration**
+inventory (including review states), labels scope, and directs admins to `/memory snapshot` for
+layered eligible knowledge. `/memory conflicts` in a layered context reports eligible conflicts
+across those same two layers, so suppressed public/local contradictions can be reviewed.
+All add/edit/delete/show/history/restore/activate/approve/retcon/merge
+operations remain local, even with a foreign/inherited UUID; administer inherited records from
+their owning configured context. Auto-extraction and switches remain local. Raw exports/imports
+are also local; only the local tool's snapshot inherits the public base.
+
+Both layers are selected in one database statement. If the database fails, the reply falls back
+to unchanged recent Discord context; no broader memory scope is queried as a fallback.
+
 Temporary live diagnostics: set `MEMORY_DEBUG_ENABLED=true` on the bot service to emit one
 `[MEMORY_DIAG]` JSON line immediately before each normal Kindroid request. Unset or `false`
 emits no memory-debug lines. Each line has a short request ID, resolved scope/visibility,
@@ -116,8 +169,8 @@ remain unchanged, independent of this diagnostic switch.
 `knownAt`: ISO timestamp when this record's owning character learned the information.
 
 Non-production notes must name their owner as a knower. Listing another kin here does not
-grant access to that kin's bot: every query still requires the record's own kin/storyline/server/
-resolved context. A reveal needs a deliberately created recipient-scoped record with its own
+grant access to that kin's bot: every query still requires the record's own kin/storyline/server
+and an explicitly permitted local/public-base context. A reveal needs a deliberately created recipient-scoped record with its own
 knowledge timestamp; optional `revealOf` links the source. Do not backdate a newly learned reveal.
 Production notes may have an empty knower list: ownership associates a production record with
 a character's workflow, not a claim that the character knows it.

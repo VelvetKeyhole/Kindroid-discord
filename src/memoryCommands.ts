@@ -141,6 +141,9 @@ export async function handleMemoryCommand(
     const command = interaction.options.getSubcommand();
     const id = interaction.options.getString("id") || "";
     const context = resolvedContext(scope);
+    if (scope.publicBaseStatus === 'missing' || scope.publicBaseStatus === 'ambiguous') {
+      console.warn(`Public memory base ${scope.publicBaseStatus}; memory administration remains local.`);
+    }
     if (command==='history') {
       const history = await runtime.store.history(scope,id);
       if (!history.length) { await respond('No history in this context.'); return; }
@@ -159,7 +162,7 @@ export async function handleMemoryCommand(
     if (command==='snapshot') {
       const rows = await new MemoryProduction(runtime.store).snapshot(scope);
       if (rows.length>1000) { await respond('Snapshot exceeds the Discord preview limit. Use the local production tool for the full snapshot.'); return; }
-      await interaction.editReply({ content:`Current eligible canon; private attachments. ${exportSafetyWarning}`, files:[
+      await interaction.editReply({ content:`Current eligible canon; public base: ${scope.publicBaseStatus ?? 'not inherited'}. Private attachments. ${exportSafetyWarning}`, files:[
         { attachment:Buffer.from(JSON.stringify(rows,null,2)),name:'current-canon.json' },
         { attachment:Buffer.from(readableCanon(scope,rows)),name:'current-canon.txt' }] }); return;
     }
@@ -183,8 +186,8 @@ export async function handleMemoryCommand(
     if (command === "list" || command === "pending") {
       const page = interaction.options.getInteger("page") ?? 1;
       const rows = await runtime.store.list(scope, page, command === "pending");
-      const lines = rows.map(m => `${m.id} | ${m.category} | ${m.status} | ${m.metadata.visibility}\nKnown by: ${m.metadata.knownByKinIds.join(', ')} | Score: ${m.candidate_importance ?? 'manual'} | Confidence: ${m.confidence ?? 'manual'}\n${m.content.replace(/\s+/g, " ").slice(0, 80)}`);
-      await respond(`Kin: ${scope.kinId} | Story: ${scope.storyline} | Page ${page}\n${lines.join("\n\n") || "No memories on this page."}`);
+      const lines = rows.map(m => `${m.id} | ${m.category} | ${m.status} | ${m.metadata.visibility}\nSource scope: ${m.context_type}:${m.context_id}\nKnown by: ${m.metadata.knownByKinIds.join(', ')} | Score: ${m.candidate_importance ?? 'manual'} | Confidence: ${m.confidence ?? 'manual'}\n${m.content.replace(/\s+/g, " ").slice(0, 80)}`);
+      await respond(`Kin: ${scope.kinId} | Story: ${scope.storyline} | Page ${page}\nLocal administration only. Public base: ${scope.publicBaseStatus ?? 'not inherited'}; /memory snapshot shows eligible reply knowledge across layers.\n${lines.join("\n\n") || "No memories on this page."}`);
       return;
     }
     if (command === "delete") {

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { MemoryScope, resolvedContext } from "./memoryConfig";
 import { MemoryRecord } from "./memoryStore";
-import { privacyEligible } from "./memoryPolicy";
+import { memoryScopeEligible, memoryLayerPrivacyEligible } from './memoryLayers';
 import { ConversationMessage } from "./types";
 
 const testMemoryId = "21e4ad40-d5d6-4cfb-9b44-d238223887be";
@@ -33,13 +33,11 @@ export function recordMemoryCandidates(
   eligible: MemoryRecord[], included: Set<MemoryRecord>
 ): void {
   if (!diagnostic) return;
-  const context = resolvedContext(scope);
   diagnostic.retrievalOutcome = "returned";
   diagnostic.memories = rows.map(memory => {
     const activeStatusEligible = memory.active && memory.status === "active";
-    const scopeEligible = memory.kin_id === scope.kinId && memory.storyline === scope.storyline &&
-      memory.guild_id === scope.guildId && memory.context_id === context.id && memory.context_type === context.type;
-    const visibilityEligible = privacyEligible(memory.metadata, scope.kinId, scope.visibility);
+    const scopeEligible = memoryScopeEligible(scope,memory);
+    const visibilityEligible = memoryLayerPrivacyEligible(scope,memory);
     const injected = included.has(memory);
     let exclusionReason: Exclusion = null;
     if (!injected) {

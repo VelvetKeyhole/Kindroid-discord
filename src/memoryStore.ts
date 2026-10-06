@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Database } from "./database";
 import { MemoryScope, resolvedContext } from "./memoryConfig";
 import { MemoryMetadata, metadataFor, conflictHint } from "./memoryPolicy";
+import { hasPublicLayer, layeredReadSql, layeredConflictsSql } from './memoryLayers';
 
 export const memoryCategories = ["relationship", "conflict", "preference", "promise", "villa_event", "challenge_outcome", "personal_fact", "emotional_shift"] as const;
 export type MemoryCategory = typeof memoryCategories[number];
@@ -166,6 +167,8 @@ export class MemoryStore {
   async retrieve(scope: MemoryScope, terms: string[], at = new Date()): Promise<MemoryRecord[]> {
     if (!Number.isFinite(at.getTime())) throw new Error('Invalid knowledge time');
     const values = await this.bindScope(scope);
+    if (hasPublicLayer(scope)) return (await this.database.query<MemoryRecord>(layeredReadSql(),
+      [...values,terms.slice(0,20),scope.visibility,at.toISOString(),scope.publicBase!.contextId,scope.publicBase!.contextType])).rows;
     return (await this.database.query<MemoryRecord>(
       `SELECT * FROM memories AS m WHERE ${scopeWhere} AND active = true AND status = 'active'
        AND memory_eligible(metadata,$1,$7,$8::timestamptz)
@@ -179,6 +182,15 @@ export class MemoryStore {
        CASE WHEN metadata->>'sourceType'='production_override' THEN 4 WHEN metadata->>'sourceType'='kindroid_export' AND (metadata->>'authoritative')::boolean THEN 3
          WHEN metadata->>'sourceType'='manual' THEN 2 ELSE 1 END DESC, updated_at DESC, id LIMIT 5`, [...values, terms.slice(0, 20), scope.visibility ?? 'public',at.toISOString()]
     )).rows;
+  }
+
+  async layeredSnapshot(scope: MemoryScope): Promise<MemoryRecord[]> {
+    if (!hasPublicLayer(scope)) throw new Error('Layered snapshot requires a configured public base');
+    const values = await this.bindScope(scope);
+    const rows = (await this.database.query<MemoryRecord>(layeredReadSql(true),
+      [...values,[],scope.visibility,new Date().toISOString(),scope.publicBase!.contextId,scope.publicBase!.contextType])).rows;
+    if (rows.length>10000) throw new Error('Production review exceeds 10000 records; use paginated exports');
+    return rows;
   }
 
   async autoSetting(scope: MemoryScope): Promise<boolean | null> {
@@ -357,6 +369,9 @@ export class MemoryStore {
 
   async conflicts(scope: MemoryScope): Promise<{ id: string; other_id: string; fact_key: string }[]> {
     const values = await this.bindScope(scope);
+    if (hasPublicLayer(scope)) return (await this.database.query<{ id: string; other_id: string; fact_key: string }>(
+      layeredConflictsSql(), [...values,[],scope.visibility,new Date().toISOString(),scope.publicBase!.contextId,scope.publicBase!.contextType]
+    )).rows;
     return (await this.database.query<{ id: string; other_id: string; fact_key: string }>(`SELECT m.id,other.id AS other_id,m.metadata->>'factKey' AS fact_key
       FROM memories m JOIN memories other ON other.id>m.id AND other.kin_id=m.kin_id AND other.storyline=m.storyline
       AND other.guild_id=m.guild_id AND other.context_id=m.context_id AND other.context_type=m.context_type
